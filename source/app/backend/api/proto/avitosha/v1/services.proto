@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package avitosha.v1;
+
+option go_package = "github.com/guitaramust-sudo/Avitosha/app/backend/internal/gen/avitosha/v1;avitoshav1";
+
+service AuthService {
+  rpc Register(RegisterRequest) returns (AuthenticationResponse);
+  rpc Login(LoginRequest) returns (AuthenticationResponse);
+  rpc Refresh(RefreshRequest) returns (RefreshResponse);
+  rpc Logout(LogoutRequest) returns (Empty);
+  rpc GetCurrentUser(GetCurrentUserRequest) returns (UserResponse);
+  rpc AuthenticateAccessToken(AuthenticateAccessTokenRequest) returns (AuthenticatedUserResponse);
+}
+
+service GameService {
+  rpc EnsureProfile(UserAtRequest) returns (JsonResponse);
+  rpc RenamePet(RenamePetRequest) returns (JsonResponse);
+  rpc ListTasks(UserAtRequest) returns (JsonResponse);
+  rpc GetTask(TaskRequest) returns (JsonResponse);
+  rpc GetTaskAdvice(TaskRequest) returns (JsonResponse);
+  rpc GetRoom(UserAtRequest) returns (JsonResponse);
+  rpc GetStory(UserAtRequest) returns (JsonResponse);
+  rpc GetDailySummary(UserAtRequest) returns (JsonResponse);
+  rpc GetLeaderboard(LeaderboardRequest) returns (JsonResponse);
+  rpc GetAchievements(UserAtRequest) returns (JsonResponse);
+  rpc GetRewardBalances(UserAtRequest) returns (JsonResponse);
+  rpc GetRewardWallet(UserAtRequest) returns (JsonResponse);
+  rpc ProcessAction(ProcessActionRequest) returns (JsonResponse);
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream EventBatch);
+}
+
+message Empty {}
+
+message RegisterRequest {
+  string email = 1;
+  string password = 2;
+  string user_agent = 3;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+  string user_agent = 3;
+}
+
+message RefreshRequest { string refresh_token = 1; }
+message LogoutRequest { string refresh_token = 1; }
+
+message GetCurrentUserRequest {
+  string user_id = 1;
+  string session_id = 2;
+}
+
+message AuthenticateAccessTokenRequest { string access_token = 1; }
+
+message User {
+  string id = 1;
+  string email = 2;
+  string created_at = 3;
+  string updated_at = 4;
+}
+
+message AuthenticationResponse {
+  User user = 1;
+  string access_token = 2;
+  string refresh_token = 3;
+}
+
+message RefreshResponse {
+  string access_token = 1;
+  string refresh_token = 2;
+}
+
+message UserResponse { User user = 1; }
+
+message AuthenticatedUserResponse {
+  string user_id = 1;
+  string session_id = 2;
+}
+
+message UserAtRequest {
+  string user_id = 1;
+  string at = 2;
+}
+
+message RenamePetRequest {
+  string user_id = 1;
+  string name = 2;
+  string at = 3;
+}
+
+message TaskRequest {
+  string user_id = 1;
+  string task_id = 2;
+  string at = 3;
+}
+
+message LeaderboardRequest {
+  string user_id = 1;
+  int32 limit = 2;
+  string at = 3;
+}
+
+message ProcessActionRequest {
+  string user_id = 1;
+  string event_id = 2;
+  string action_type = 3;
+  optional string entity_id = 4;
+  optional string category = 5;
+  bytes metadata_json = 6;
+  string occurred_at = 7;
+  string now = 8;
+}
+
+// Each RPC is explicitly typed; payload_json is a temporary anti-corruption
+// envelope for the existing domain read models. It keeps JSON out of routing
+// and can be replaced message-by-message without changing HTTP clients.
+message JsonResponse { bytes payload_json = 1; }
+
+message SubscribeEventsRequest { string user_id = 1; }
+message EventBatch { bytes payload_json = 1; }

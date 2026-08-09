@@ -1,0 +1,136 @@
+From 6098a6a30973f3bc184b082f943a09949fbb1302 Mon Sep 17 00:00:00 2001
+From: sergey <152873255+hhanqq@users.noreply.github.com>
+Date: Wed, 5 Aug 2026 10:00:01 +0300
+Subject: [PATCH] test(game): cover complete first room journey
+
+---
+ .../internal/usecase/game_service_test.go     | 97 +++++++++++++++++++
+ 1 file changed, 97 insertions(+)
+
+diff --git a/app/backend/internal/usecase/game_service_test.go b/app/backend/internal/usecase/game_service_test.go
+index dc3dfe8..f294f33 100644
+--- a/app/backend/internal/usecase/game_service_test.go
++++ b/app/backend/internal/usecase/game_service_test.go
+@@ -57,8 +57,14 @@ func newGameTestRepository(userID uuid.UUID) *gameTestRepository {
+ 	storyCode := FirstRoomStoryCode
+ 	stageOne := 1
+ 	stageTwo := 2
++	stageThree := 3
++	stageFour := 4
++	stageFive := 5
+ 	desk := "DESK"
+ 	lamp := "LAMP"
++	chair := "CHAIR"
++	plant := "PLANT"
++	poster := "POSTER"
+ 	return &gameTestRepository{
+ 		tasksByStage: map[int]model.Task{
+ 			1: {
+@@ -73,6 +79,21 @@ func newGameTestRepository(userID uuid.UUID) *gameTestRepository {
+ 				TargetValue: 1, XPReward: 30, RoomItemCode: &lamp,
+ 				StoryCode: &storyCode, StoryStage: &stageTwo, IsActive: true,
+ 			},
++			3: {
++				ID: uuid.New(), Code: "MESSAGE_SELLER", Title: "Кресло",
++				ActionType: model.ActionTypeMessageSent, TargetValue: 1, XPReward: 40,
++				RoomItemCode: &chair, StoryCode: &storyCode, StoryStage: &stageThree, IsActive: true,
++			},
++			4: {
++				ID: uuid.New(), Code: "CREATE_FIRST_AD", Title: "Растение",
++				ActionType: model.ActionTypeAdCreated, TargetValue: 1, XPReward: 50,
++				RoomItemCode: &plant, StoryCode: &storyCode, StoryStage: &stageFour, IsActive: true,
++			},
++			5: {
++				ID: uuid.New(), Code: "USE_DELIVERY", Title: "Постер",
++				ActionType: model.ActionTypeDeliveryUsed, TargetValue: 1, XPReward: 80,
++				RoomItemCode: &poster, StoryCode: &storyCode, StoryStage: &stageFive, IsActive: true,
++			},
+ 		},
+ 		userTasks: make(map[uuid.UUID]model.UserTask), actions: make(map[uuid.UUID]model.UserAction),
+ 		roomItems: make(map[string]model.UserRoomItem), achievements: make(map[string]model.UserAchievement),
+@@ -368,6 +389,82 @@ func TestProcessActionCompletesFirstRoomStageAndIsIdempotent(t *testing.T) {
+ 	}
+ }
+ 
++func TestEndToEndCompletesFirstRoom(t *testing.T) {
++	userID := uuid.New()
++	repository := newGameTestRepository(userID)
++	txManager := &gameTestTxManager{}
++	publisher := &gameTestPublisher{txManager: txManager}
++	service := NewGameService(GameServiceDependencies{
++		Repository: repository, TxManager: txManager, IDGenerator: uuid.New, Publisher: publisher,
++	})
++	now := time.Date(2026, 8, 5, 9, 0, 0, 0, time.UTC)
++	furniture := "FURNITURE"
++	actions := []struct {
++		actionType model.ActionType
++		category   *string
++	}{
++		{model.ActionTypeAdViewed, &furniture},
++		{model.ActionTypeAdViewed, &furniture},
++		{model.ActionTypeAdViewed, &furniture},
++		{model.ActionTypeAdViewed, &furniture},
++		{model.ActionTypeAdViewed, &furniture},
++		{model.ActionTypeAdFavorited, &furniture},
++		{model.ActionTypeMessageSent, nil},
++		{model.ActionTypeAdCreated, nil},
++		{model.ActionTypeDeliveryUsed, nil},
++	}
++
++	var last ProcessActionCommand
++	for index, action := range actions {
++		last = ProcessActionCommand{
++			UserID: userID, EventID: uuid.New(), ActionType: action.actionType,
++			EntityID: gameStringPointer("entity-" + string(rune('a'+index))), Category: action.category,
++			Metadata: json.RawMessage(`{}`), OccurredAt: now.Add(time.Duration(index) * time.Minute),
++			Now: now.Add(time.Duration(index) * time.Minute),
++		}
++		if _, err := service.ProcessAction(context.Background(), last); err != nil {
++			t.Fatalf("action %d (%s): %v", index+1, action.actionType, err)
++		}
++	}
++
++	if repository.story.Status != model.StoryStatusCompleted || repository.story.CurrentStage != 5 ||
++		repository.story.CompletedAt == nil {
++		t.Fatalf("story = %+v", repository.story)
++	}
++	if repository.pet.GrowthXP != 230 || repository.pet.Level != 2 || repository.pet.Mood != model.PetMoodProud {
++		t.Fatalf("pet = %+v", repository.pet)
++	}
++	if repository.pet.Character == nil || *repository.pet.Character != model.PetCharacterExplorer {
++		t.Fatalf("character = %v, want EXPLORER", repository.pet.Character)
++	}
++	for _, itemCode := range []string{"BOX", "DESK", "LAMP", "CHAIR", "PLANT", "POSTER"} {
++		if _, ok := repository.roomItems[itemCode]; !ok {
++			t.Errorf("room item %s is missing", itemCode)
++		}
++	}
++	if repository.weekly.EarnedXP != 230 || repository.weekly.CompletedTasks != 5 ||
++		repository.weekly.CompletedStages != 5 || repository.weekly.Score != 580 {
++		t.Fatalf("weekly = %+v", repository.weekly)
++	}
++	if repository.daily.ActionsCount != 9 || repository.daily.CompletedTasks != 5 ||
++		repository.daily.EarnedXP != 230 || repository.daily.StoryStageAfter != 5 {
++		t.Fatalf("daily = %+v", repository.daily)
++	}
++	for _, code := range []string{"FIRST_STEP", "HOUSEWARMING", "EXPLORER", "IN_TOUCH", "FIRST_AD", "ROOM_COMPLETE"} {
++		if _, ok := repository.achievements[code]; !ok {
++			t.Errorf("achievement %s is missing", code)
++		}
++	}
++
++	duplicate, err := service.ProcessAction(context.Background(), last)
++	if err != nil || !duplicate.Duplicate {
++		t.Fatalf("duplicate = %+v, error = %v", duplicate, err)
++	}
++	if repository.weekly.Score != 580 || repository.pet.GrowthXP != 230 || repository.daily.ActionsCount != 9 {
++		t.Fatal("duplicate final action changed completed room state")
++	}
++}
++
+ func gameStringPointer(value string) *string {
+ 	return &value
+ }
+-- 
+2.50.1 (Apple Git-155)
+

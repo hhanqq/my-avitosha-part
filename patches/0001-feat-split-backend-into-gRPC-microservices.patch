@@ -1,0 +1,4393 @@
+From 187be5d9ddd6bd03b0d1cbf8904ee6e2e1d7ec6d Mon Sep 17 00:00:00 2001
+From: sergey <152873255+hhanqq@users.noreply.github.com>
+Date: Sat, 8 Aug 2026 11:51:06 +0300
+Subject: [PATCH] feat: split backend into gRPC microservices
+
+---
+ app/backend/Dockerfile                        |   10 +-
+ .../api/proto/avitosha/v1/services.proto      |  122 ++
+ app/backend/buf.gen.yaml                      |   10 +
+ app/backend/buf.yaml                          |   15 +
+ app/backend/cmd/api/main.go                   |    4 +-
+ app/backend/cmd/auth/main.go                  |   29 +
+ app/backend/cmd/game/main.go                  |   29 +
+ app/backend/go.mod                            |   14 +-
+ app/backend/go.sum                            |   46 +-
+ app/backend/internal/app/microservices.go     |  254 +++
+ .../internal/client/grpc/authclient/client.go |  113 ++
+ .../internal/client/grpc/gameclient/client.go |  158 ++
+ app/backend/internal/config/config.go         |  104 +-
+ app/backend/internal/config/config_test.go    |   43 +
+ .../internal/gen/avitosha/v1/services.pb.go   | 1731 +++++++++++++++++
+ .../gen/avitosha/v1/services_grpc.pb.go       |  913 +++++++++
+ app/backend/internal/handler/game_ws.go       |    4 +-
+ app/backend/internal/handler/router.go        |    2 +-
+ app/backend/internal/realtime/hub.go          |   11 +-
+ app/backend/internal/rpc/errors.go            |   95 +
+ .../transport/grpc/authserver/server.go       |  127 ++
+ .../transport/grpc/gameserver/server.go       |  232 +++
+ app/backend/scripts/smoke-game.sh             |    2 +-
+ 23 files changed, 4044 insertions(+), 24 deletions(-)
+ create mode 100644 app/backend/api/proto/avitosha/v1/services.proto
+ create mode 100644 app/backend/buf.gen.yaml
+ create mode 100644 app/backend/buf.yaml
+ create mode 100644 app/backend/cmd/auth/main.go
+ create mode 100644 app/backend/cmd/game/main.go
+ create mode 100644 app/backend/internal/app/microservices.go
+ create mode 100644 app/backend/internal/client/grpc/authclient/client.go
+ create mode 100644 app/backend/internal/client/grpc/gameclient/client.go
+ create mode 100644 app/backend/internal/gen/avitosha/v1/services.pb.go
+ create mode 100644 app/backend/internal/gen/avitosha/v1/services_grpc.pb.go
+ create mode 100644 app/backend/internal/rpc/errors.go
+ create mode 100644 app/backend/internal/transport/grpc/authserver/server.go
+ create mode 100644 app/backend/internal/transport/grpc/gameserver/server.go
+
+diff --git a/app/backend/Dockerfile b/app/backend/Dockerfile
+index 980679e..c0be915 100644
+--- a/app/backend/Dockerfile
++++ b/app/backend/Dockerfile
+@@ -7,14 +7,18 @@ RUN go mod download
+ 
+ COPY . .
+ 
+-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/api ./cmd/api
++RUN CGO_ENABLED=0 GOOS=linux go build -o /out/api ./cmd/api \
++    && CGO_ENABLED=0 GOOS=linux go build -o /out/auth-service ./cmd/auth \
++    && CGO_ENABLED=0 GOOS=linux go build -o /out/game-service ./cmd/game
+ 
+ FROM alpine:3.22.0
+ 
+ WORKDIR /app
+ 
+ COPY --from=build /out/api /usr/local/bin/api
++COPY --from=build /out/auth-service /usr/local/bin/auth-service
++COPY --from=build /out/game-service /usr/local/bin/game-service
+ 
+-EXPOSE 8080
++EXPOSE 8080 9091 9092
+ 
+-ENTRYPOINT ["/usr/local/bin/api"]
++CMD ["/usr/local/bin/api"]
+diff --git a/app/backend/api/proto/avitosha/v1/services.proto b/app/backend/api/proto/avitosha/v1/services.proto
+new file mode 100644
+index 0000000..91dd23b
+--- /dev/null
++++ b/app/backend/api/proto/avitosha/v1/services.proto
+@@ -0,0 +1,122 @@
++syntax = "proto3";
++
++package avitosha.v1;
++
++option go_package = "github.com/guitaramust-sudo/Avitosha/app/backend/internal/gen/avitosha/v1;avitoshav1";
++
++service AuthService {
++  rpc Register(RegisterRequest) returns (AuthenticationResponse);
++  rpc Login(LoginRequest) returns (AuthenticationResponse);
++  rpc Refresh(RefreshRequest) returns (RefreshResponse);
++  rpc Logout(LogoutRequest) returns (Empty);
++  rpc GetCurrentUser(GetCurrentUserRequest) returns (UserResponse);
++  rpc AuthenticateAccessToken(AuthenticateAccessTokenRequest) returns (AuthenticatedUserResponse);
++}
++
++service GameService {
++  rpc EnsureProfile(UserAtRequest) returns (JsonResponse);
++  rpc RenamePet(RenamePetRequest) returns (JsonResponse);
++  rpc ListTasks(UserAtRequest) returns (JsonResponse);
++  rpc GetTask(TaskRequest) returns (JsonResponse);
++  rpc GetTaskAdvice(TaskRequest) returns (JsonResponse);
++  rpc GetRoom(UserAtRequest) returns (JsonResponse);
++  rpc GetStory(UserAtRequest) returns (JsonResponse);
++  rpc GetDailySummary(UserAtRequest) returns (JsonResponse);
++  rpc GetLeaderboard(LeaderboardRequest) returns (JsonResponse);
++  rpc GetAchievements(UserAtRequest) returns (JsonResponse);
++  rpc GetRewardBalances(UserAtRequest) returns (JsonResponse);
++  rpc GetRewardWallet(UserAtRequest) returns (JsonResponse);
++  rpc ProcessAction(ProcessActionRequest) returns (JsonResponse);
++  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream EventBatch);
++}
++
++message Empty {}
++
++message RegisterRequest {
++  string email = 1;
++  string password = 2;
++  string user_agent = 3;
++}
++
++message LoginRequest {
++  string email = 1;
++  string password = 2;
++  string user_agent = 3;
++}
++
++message RefreshRequest { string refresh_token = 1; }
++message LogoutRequest { string refresh_token = 1; }
++
++message GetCurrentUserRequest {
++  string user_id = 1;
++  string session_id = 2;
++}
++
++message AuthenticateAccessTokenRequest { string access_token = 1; }
++
++message User {
++  string id = 1;
++  string email = 2;
++  string created_at = 3;
++  string updated_at = 4;
++}
++
++message AuthenticationResponse {
++  User user = 1;
++  string access_token = 2;
++  string refresh_token = 3;
++}
++
++message RefreshResponse {
++  string access_token = 1;
++  string refresh_token = 2;
++}
++
++message UserResponse { User user = 1; }
++
++message AuthenticatedUserResponse {
++  string user_id = 1;
++  string session_id = 2;
++}
++
++message UserAtRequest {
++  string user_id = 1;
++  string at = 2;
++}
++
++message RenamePetRequest {
++  string user_id = 1;
++  string name = 2;
++  string at = 3;
++}
++
++message TaskRequest {
++  string user_id = 1;
++  string task_id = 2;
++  string at = 3;
++}
++
++message LeaderboardRequest {
++  string user_id = 1;
++  int32 limit = 2;
++  string at = 3;
++}
++
++message ProcessActionRequest {
++  string user_id = 1;
++  string event_id = 2;
++  string action_type = 3;
++  optional string entity_id = 4;
++  optional string category = 5;
++  bytes metadata_json = 6;
++  string occurred_at = 7;
++  string now = 8;
++}
++
++// Each RPC is explicitly typed; payload_json is a temporary anti-corruption
++// envelope for the existing domain read models. It keeps JSON out of routing
++// and can be replaced message-by-message without changing HTTP clients.
++message JsonResponse { bytes payload_json = 1; }
++
++message SubscribeEventsRequest { string user_id = 1; }
++message EventBatch { bytes payload_json = 1; }
+diff --git a/app/backend/buf.gen.yaml b/app/backend/buf.gen.yaml
+new file mode 100644
+index 0000000..23b6b86
+--- /dev/null
++++ b/app/backend/buf.gen.yaml
+@@ -0,0 +1,10 @@
++version: v2
++plugins:
++  - local: protoc-gen-go
++    out: .
++    opt:
++      - module=github.com/guitaramust-sudo/Avitosha/app/backend
++  - local: protoc-gen-go-grpc
++    out: .
++    opt:
++      - module=github.com/guitaramust-sudo/Avitosha/app/backend
+diff --git a/app/backend/buf.yaml b/app/backend/buf.yaml
+new file mode 100644
+index 0000000..8fd9224
+--- /dev/null
++++ b/app/backend/buf.yaml
+@@ -0,0 +1,15 @@
++version: v2
++modules:
++  - path: api/proto
++lint:
++  use:
++    - STANDARD
++  except:
++    # Transitional JSON read-model envelopes are intentionally reused while
++    # each RPC keeps a distinct method and typed command/request fields.
++    - RPC_REQUEST_RESPONSE_UNIQUE
++    - RPC_REQUEST_STANDARD_NAME
++    - RPC_RESPONSE_STANDARD_NAME
++breaking:
++  use:
++    - FILE
+diff --git a/app/backend/cmd/api/main.go b/app/backend/cmd/api/main.go
+index f57a80f..accc830 100644
+--- a/app/backend/cmd/api/main.go
++++ b/app/backend/cmd/api/main.go
+@@ -11,7 +11,7 @@ import (
+ )
+ 
+ func main() {
+-	cfg, err := config.Load()
++	cfg, err := config.LoadGateway()
+ 	if err != nil {
+ 		_, _ = fmt.Fprintf(os.Stderr, "api failed: load config: %v\n", err)
+ 		os.Exit(1)
+@@ -21,7 +21,7 @@ func main() {
+ 		Level: cfg.LogLevel.Level(),
+ 	}))
+ 
+-	application, err := app.New(context.Background(), cfg, logger)
++	application, err := app.NewGateway(cfg, logger)
+ 	if err != nil {
+ 		_, _ = fmt.Fprintf(os.Stderr, "api failed: %v\n", err)
+ 		os.Exit(1)
+diff --git a/app/backend/cmd/auth/main.go b/app/backend/cmd/auth/main.go
+new file mode 100644
+index 0000000..918e5bf
+--- /dev/null
++++ b/app/backend/cmd/auth/main.go
+@@ -0,0 +1,29 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"log/slog"
++	"os"
++
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/app"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/config"
++)
++
++func main() {
++	cfg, err := config.LoadAuthService()
++	if err != nil {
++		_, _ = fmt.Fprintf(os.Stderr, "auth-service failed: load config: %v\n", err)
++		os.Exit(1)
++	}
++	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel.Level()}))
++	application, err := app.NewAuthGRPCService(context.Background(), cfg, logger)
++	if err != nil {
++		_, _ = fmt.Fprintf(os.Stderr, "auth-service failed: %v\n", err)
++		os.Exit(1)
++	}
++	if err := application.Run(context.Background()); err != nil {
++		_, _ = fmt.Fprintf(os.Stderr, "auth-service failed: %v\n", err)
++		os.Exit(1)
++	}
++}
+diff --git a/app/backend/cmd/game/main.go b/app/backend/cmd/game/main.go
+new file mode 100644
+index 0000000..e6d76dc
+--- /dev/null
++++ b/app/backend/cmd/game/main.go
+@@ -0,0 +1,29 @@
++package main
++
++import (
++	"context"
++	"fmt"
++	"log/slog"
++	"os"
++
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/app"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/config"
++)
++
++func main() {
++	cfg, err := config.LoadGameService()
++	if err != nil {
++		_, _ = fmt.Fprintf(os.Stderr, "game-service failed: load config: %v\n", err)
++		os.Exit(1)
++	}
++	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel.Level()}))
++	application, err := app.NewGameGRPCService(context.Background(), cfg, logger)
++	if err != nil {
++		_, _ = fmt.Fprintf(os.Stderr, "game-service failed: %v\n", err)
++		os.Exit(1)
++	}
++	if err := application.Run(context.Background()); err != nil {
++		_, _ = fmt.Fprintf(os.Stderr, "game-service failed: %v\n", err)
++		os.Exit(1)
++	}
++}
+diff --git a/app/backend/go.mod b/app/backend/go.mod
+index 5ef918c..7394dbe 100644
+--- a/app/backend/go.mod
++++ b/app/backend/go.mod
+@@ -7,15 +7,17 @@ require (
+ 	github.com/go-chi/chi/v5 v5.2.3
+ 	github.com/golang-jwt/jwt/v5 v5.2.3
+ 	github.com/google/uuid v1.6.0
++	github.com/gorilla/websocket v1.5.3
+ 	github.com/jackc/pgx/v5 v5.7.6
+ 	github.com/swaggo/files v0.0.0-20220610200504-28940afbdbfe
+-	golang.org/x/crypto v0.37.0
++	golang.org/x/crypto v0.39.0
++	google.golang.org/grpc v1.75.1
++	google.golang.org/protobuf v1.36.8
+ )
+ 
+ require (
+ 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
+ 	github.com/go-openapi/swag v0.23.0 // indirect
+-	github.com/gorilla/websocket v1.5.3 // indirect
+ 	github.com/jackc/pgpassfile v1.0.0 // indirect
+ 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+ 	github.com/jackc/puddle/v2 v2.2.2 // indirect
+@@ -26,8 +28,10 @@ require (
+ 	github.com/oasdiff/yaml3 v0.0.0-20250309153720-d2182401db90 // indirect
+ 	github.com/perimeterx/marshmallow v1.1.5 // indirect
+ 	github.com/woodsbury/decimal128 v1.3.0 // indirect
+-	golang.org/x/net v0.21.0 // indirect
+-	golang.org/x/sync v0.13.0 // indirect
+-	golang.org/x/text v0.24.0 // indirect
++	golang.org/x/net v0.41.0 // indirect
++	golang.org/x/sync v0.15.0 // indirect
++	golang.org/x/sys v0.33.0 // indirect
++	golang.org/x/text v0.26.0 // indirect
++	google.golang.org/genproto/googleapis/rpc v0.0.0-20250707201910-8d1bb00bc6a7 // indirect
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+ )
+diff --git a/app/backend/go.sum b/app/backend/go.sum
+index 854be4c..4924469 100644
+--- a/app/backend/go.sum
++++ b/app/backend/go.sum
+@@ -5,6 +5,10 @@ github.com/getkin/kin-openapi v0.133.0 h1:pJdmNohVIJ97r4AUFtEXRXwESr8b0bD721u/Tz
+ github.com/getkin/kin-openapi v0.133.0/go.mod h1:boAciF6cXk5FhPqe/NQeBTeenbjqU4LhWBf09ILVvWE=
+ github.com/go-chi/chi/v5 v5.2.3 h1:WQIt9uxdsAbgIYgid+BpYc+liqQZGMHRaUwp0JUcvdE=
+ github.com/go-chi/chi/v5 v5.2.3/go.mod h1:L2yAIGWB3H+phAw1NxKwWM+7eUH/lU8pOMm5hHcoops=
++github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
++github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
++github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
++github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
+ github.com/go-openapi/jsonpointer v0.21.0 h1:YgdVicSA9vH5RiHs9TZW5oyafXZFc6+2Vc1rr/O9oNQ=
+ github.com/go-openapi/jsonpointer v0.21.0/go.mod h1:IUyH9l/+uyhIYQ/PXVA41Rexl+kOkAPDdXEYns6fzUY=
+ github.com/go-openapi/swag v0.23.0 h1:vsEVJDUo2hPJ2tu0/Xc+4noaxyEffXNIs3cOULZ+GrE=
+@@ -13,6 +17,10 @@ github.com/go-test/deep v1.0.8 h1:TDsG77qcSprGbC6vTN8OuXp5g+J+b5Pcguhf7Zt61VM=
+ github.com/go-test/deep v1.0.8/go.mod h1:5C2ZWiW0ErCdrYzpqxLbTX7MG14M9iiw8DgHncVwcsE=
+ github.com/golang-jwt/jwt/v5 v5.2.3 h1:kkGXqQOBSDDWRhWNXTFpqGSCMyh/PLnqUvMGJPDJDs0=
+ github.com/golang-jwt/jwt/v5 v5.2.3/go.mod h1:pqrtFR0X4osieyHYxtmOUWsAWrfe1Q5UVIyoH402zdk=
++github.com/golang/protobuf v1.5.4 h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek=
++github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6rSs7xps=
++github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
++github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+ github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+ github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
+@@ -56,20 +64,42 @@ github.com/ugorji/go/codec v1.2.7 h1:YPXUKf7fYbp/y8xloBqZOw2qaVggbfwMlI8WM3wZUJ0
+ github.com/ugorji/go/codec v1.2.7/go.mod h1:WGN1fab3R1fzQlVQTkfxVtIBhWDRqOviHU95kRgeqEY=
+ github.com/woodsbury/decimal128 v1.3.0 h1:8pffMNWIlC0O5vbyHWFZAt5yWvWcrHA+3ovIIjVWss0=
+ github.com/woodsbury/decimal128 v1.3.0/go.mod h1:C5UTmyTjW3JftjUFzOVhC20BEQa2a4ZKOB5I6Zjb+ds=
+-golang.org/x/crypto v0.37.0 h1:kJNSjF/Xp7kU0iB2Z+9viTPMW4EqqsrywMXLJOOsXSE=
+-golang.org/x/crypto v0.37.0/go.mod h1:vg+k43peMZ0pUMhYmVAWysMK35e6ioLh3wB8ZCAfbVc=
++go.opentelemetry.io/auto/sdk v1.1.0 h1:cH53jehLUN6UFLY71z+NDOiNJqDdPRaXzTel0sJySYA=
++go.opentelemetry.io/auto/sdk v1.1.0/go.mod h1:3wSPjt5PWp2RhlCcmmOial7AvC4DQqZb7a7wCow3W8A=
++go.opentelemetry.io/otel v1.37.0 h1:9zhNfelUvx0KBfu/gb+ZgeAfAgtWrfHJZcAqFC228wQ=
++go.opentelemetry.io/otel v1.37.0/go.mod h1:ehE/umFRLnuLa/vSccNq9oS1ErUlkkK71gMcN34UG8I=
++go.opentelemetry.io/otel/metric v1.37.0 h1:mvwbQS5m0tbmqML4NqK+e3aDiO02vsf/WgbsdpcPoZE=
++go.opentelemetry.io/otel/metric v1.37.0/go.mod h1:04wGrZurHYKOc+RKeye86GwKiTb9FKm1WHtO+4EVr2E=
++go.opentelemetry.io/otel/sdk v1.37.0 h1:ItB0QUqnjesGRvNcmAcU0LyvkVyGJ2xftD29bWdDvKI=
++go.opentelemetry.io/otel/sdk v1.37.0/go.mod h1:VredYzxUvuo2q3WRcDnKDjbdvmO0sCzOvVAiY+yUkAg=
++go.opentelemetry.io/otel/sdk/metric v1.37.0 h1:90lI228XrB9jCMuSdA0673aubgRobVZFhbjxHHspCPc=
++go.opentelemetry.io/otel/sdk/metric v1.37.0/go.mod h1:cNen4ZWfiD37l5NhS+Keb5RXVWZWpRE+9WyVCpbo5ps=
++go.opentelemetry.io/otel/trace v1.37.0 h1:HLdcFNbRQBE2imdSEgm/kwqmQj1Or1l/7bW6mxVK7z4=
++go.opentelemetry.io/otel/trace v1.37.0/go.mod h1:TlgrlQ+PtQO5XFerSPUYG0JSgGyryXewPGyayAWSBS0=
++golang.org/x/crypto v0.39.0 h1:SHs+kF4LP+f+p14esP5jAoDpHU8Gu/v9lFRK6IT5imM=
++golang.org/x/crypto v0.39.0/go.mod h1:L+Xg3Wf6HoL4Bn4238Z6ft6KfEpN0tJGo53AAPC632U=
+ golang.org/x/net v0.0.0-20210805182204-aaa1db679c0d/go.mod h1:9nx3DQGgdP8bBQD5qxJ1jj9UTztislL4KSBs9R2vV5Y=
+-golang.org/x/net v0.21.0 h1:AQyQV4dYCvJ7vGmJyKki9+PBdyvhkSd8EIx/qb0AYv4=
+-golang.org/x/net v0.21.0/go.mod h1:bIjVDfnllIU7BJ2DNgfnXvpSvtn8VRwhlsaeUTyUS44=
+-golang.org/x/sync v0.13.0 h1:AauUjRAJ9OSnvULf/ARrrVywoJDy0YS2AwQ98I37610=
+-golang.org/x/sync v0.13.0/go.mod h1:1dzgHSNfp02xaA81J2MS99Qcpr2w7fw1gpm99rleRqA=
++golang.org/x/net v0.41.0 h1:vBTly1HeNPEn3wtREYfy4GZ/NECgw2Cnl+nK6Nz3uvw=
++golang.org/x/net v0.41.0/go.mod h1:B/K4NNqkfmg07DQYrbwvSluqCJOOXwUjeb/5lOisjbA=
++golang.org/x/sync v0.15.0 h1:KWH3jNZsfyT6xfAfKiz6MRNmd46ByHDYaZ7KSkCtdW8=
++golang.org/x/sync v0.15.0/go.mod h1:1dzgHSNfp02xaA81J2MS99Qcpr2w7fw1gpm99rleRqA=
+ golang.org/x/sys v0.0.0-20201119102817-f84b799fce68/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+ golang.org/x/sys v0.0.0-20210423082822-04245dca01da/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.33.0 h1:q3i8TbbEz+JRD9ywIRlyRAQbM0qF7hu24q3teo2hbuw=
++golang.org/x/sys v0.33.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
+ golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
+ golang.org/x/text v0.3.6/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+-golang.org/x/text v0.24.0 h1:dd5Bzh4yt5KYA8f9CJHCP4FB4D51c2c6JvN37xJJkJ0=
+-golang.org/x/text v0.24.0/go.mod h1:L8rBsPeo2pSS+xqN0d5u2ikmjtmoJbDBT1b7nHvFCdU=
++golang.org/x/text v0.26.0 h1:P42AVeLghgTYr4+xUnTRKDMqpar+PtX7KWuNQL21L8M=
++golang.org/x/text v0.26.0/go.mod h1:QK15LZJUUQVJxhz7wXgxSy/CJaTFjd0G+YLonydOVQA=
+ golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
++gonum.org/v1/gonum v0.16.0 h1:5+ul4Swaf3ESvrOnidPp4GZbzf0mxVQpDCYUQE7OJfk=
++gonum.org/v1/gonum v0.16.0/go.mod h1:fef3am4MQ93R2HHpKnLk4/Tbh/s0+wqD5nfa6Pnwy4E=
++google.golang.org/genproto/googleapis/rpc v0.0.0-20250707201910-8d1bb00bc6a7 h1:pFyd6EwwL2TqFf8emdthzeX+gZE1ElRq3iM8pui4KBY=
++google.golang.org/genproto/googleapis/rpc v0.0.0-20250707201910-8d1bb00bc6a7/go.mod h1:qQ0YXyHHx3XkvlzUtpXDkS29lDSafHMZBAZDc03LQ3A=
++google.golang.org/grpc v1.75.1 h1:/ODCNEuf9VghjgO3rqLcfg8fiOP0nSluljWFlDxELLI=
++google.golang.org/grpc v1.75.1/go.mod h1:JtPAzKiq4v1xcAB2hydNlWI2RnF85XXcV0mhKXr2ecQ=
++google.golang.org/protobuf v1.36.8 h1:xHScyCOEuuwZEc6UtSOvPbAT4zRh0xcNRYekJwfqyMc=
++google.golang.org/protobuf v1.36.8/go.mod h1:fuxRtAxBytpl4zzqUh6/eyUujkJdNiuEkXntxiD/uRU=
+ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+ gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c h1:Hei/4ADfdWqJk1ZMxUNpqntNwaWcugrBjAiHlqqRiVk=
+ gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c/go.mod h1:JHkPIbrfpd72SG/EVd6muEfDQjcINNoR0C8j2r3qZ4Q=
+diff --git a/app/backend/internal/app/microservices.go b/app/backend/internal/app/microservices.go
+new file mode 100644
+index 0000000..d85fe9a
+--- /dev/null
++++ b/app/backend/internal/app/microservices.go
+@@ -0,0 +1,254 @@
++package app
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"log/slog"
++	"net"
++	"net/http"
++	"os"
++	"os/signal"
++	"syscall"
++	"time"
++
++	backendauth "github.com/guitaramust-sudo/Avitosha/app/backend/internal/auth"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/client/grpc/authclient"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/client/grpc/gameclient"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/config"
++	avitoshav1 "github.com/guitaramust-sudo/Avitosha/app/backend/internal/gen/avitosha/v1"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/handler"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/realtime"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/repository/postgres"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/transport/grpc/authserver"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/transport/grpc/gameserver"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/usecase"
++	"github.com/jackc/pgx/v5/pgxpool"
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/credentials/insecure"
++	"google.golang.org/grpc/health"
++	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
++)
++
++const downstreamUnaryTimeout = 8 * time.Second
++
++type GatewayApp struct {
++	logger          *slog.Logger
++	server          *http.Server
++	connections     []*grpc.ClientConn
++	shutdownTimeout time.Duration
++}
++
++func NewGateway(cfg config.Config, logger *slog.Logger) (*GatewayApp, error) {
++	clientOptions := []grpc.DialOption{
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithUnaryInterceptor(defaultUnaryDeadline),
++	}
++	authConnection, err := grpc.NewClient(cfg.AuthGRPCAddr, clientOptions...)
++	if err != nil {
++		return nil, fmt.Errorf("connect auth service: %w", err)
++	}
++	gameConnection, err := grpc.NewClient(cfg.GameGRPCAddr, clientOptions...)
++	if err != nil {
++		_ = authConnection.Close()
++		return nil, fmt.Errorf("connect game service: %w", err)
++	}
++
++	auth := authclient.New(avitoshav1.NewAuthServiceClient(authConnection))
++	game := gameclient.New(avitoshav1.NewGameServiceClient(gameConnection))
++	ready := grpcServicesPinger{
++		healthv1.NewHealthClient(authConnection), healthv1.NewHealthClient(gameConnection),
++	}
++	router := handler.NewRouter(handler.RouterDependencies{
++		Logger: logger, DB: ready, AuthService: auth, AccessTokenAuthenticator: auth,
++		FrontendOrigin: cfg.FrontendOrigin, RefreshTokenTTL: cfg.RefreshTokenTTL,
++		SecureRefreshCookie: cfg.AppEnv == config.AppEnvProd, GameService: game, EventHub: game,
++	})
++	return &GatewayApp{
++		logger: logger, connections: []*grpc.ClientConn{authConnection, gameConnection},
++		shutdownTimeout: cfg.ShutdownTimeout,
++		server: &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadTimeout: cfg.HTTPReadTimeout,
++			WriteTimeout: cfg.HTTPWriteTimeout, IdleTimeout: cfg.HTTPIdleTimeout},
++	}, nil
++}
++
++func (a *GatewayApp) Run(ctx context.Context) error {
++	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
++	defer stop()
++	defer func() {
++		for _, connection := range a.connections {
++			_ = connection.Close()
++		}
++	}()
++	errChannel := make(chan error, 1)
++	go func() {
++		a.logger.Info("api gateway started", "addr", a.server.Addr)
++		err := a.server.ListenAndServe()
++		if errors.Is(err, http.ErrServerClosed) {
++			err = nil
++		}
++		errChannel <- err
++	}()
++	select {
++	case err := <-errChannel:
++		if err != nil {
++			return fmt.Errorf("serve api gateway: %w", err)
++		}
++		return nil
++	case <-runCtx.Done():
++	}
++	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.shutdownTimeout)
++	defer cancel()
++	if err := a.server.Shutdown(shutdownCtx); err != nil {
++		return fmt.Errorf("shutdown api gateway: %w", err)
++	}
++	return <-errChannel
++}
++
++type GRPCServiceApp struct {
++	name            string
++	addr            string
++	logger          *slog.Logger
++	server          *grpc.Server
++	db              *pgxpool.Pool
++	shutdownTimeout time.Duration
++}
++
++func NewAuthGRPCService(ctx context.Context, cfg config.Config, logger *slog.Logger) (*GRPCServiceApp, error) {
++	pool, err := openDatabase(ctx, cfg.DatabaseURL)
++	if err != nil {
++		return nil, err
++	}
++	passwordHasher, err := backendauth.NewBcryptPasswordHasher(0)
++	if err != nil {
++		pool.Close()
++		return nil, fmt.Errorf("create password hasher: %w", err)
++	}
++	tokenProvider, err := backendauth.NewJWTTokenProvider(backendauth.JWTTokenProviderConfig{
++		SigningKey: []byte(cfg.JWTSigningKey), Issuer: cfg.JWTIssuer, Audience: cfg.JWTAudience,
++	})
++	if err != nil {
++		pool.Close()
++		return nil, fmt.Errorf("create token provider: %w", err)
++	}
++	txManager := postgres.NewTxManager(pool)
++	auth, err := usecase.NewAuthService(usecase.AuthConfig{AccessTokenTTL: cfg.AccessTokenTTL, RefreshTokenTTL: cfg.RefreshTokenTTL}, usecase.AuthDependencies{
++		PasswordHasher: passwordHasher, TokenProvider: tokenProvider,
++		UserRepository: postgres.NewUserRepository(pool), SessionRepository: postgres.NewSessionRepository(pool), TxManager: txManager,
++	})
++	if err != nil {
++		pool.Close()
++		return nil, fmt.Errorf("create auth service: %w", err)
++	}
++	authenticator, err := usecase.NewAccessTokenAuthService(usecase.AccessTokenAuthDependencies{
++		AccessTokenVerifier: tokenProvider, SessionRepository: postgres.NewSessionRepository(pool),
++	})
++	if err != nil {
++		pool.Close()
++		return nil, fmt.Errorf("create authenticator: %w", err)
++	}
++	server := grpc.NewServer()
++	avitoshav1.RegisterAuthServiceServer(server, authserver.New(auth, authenticator))
++	registerHealth(server)
++	return &GRPCServiceApp{name: "auth-service", addr: cfg.GRPCAddr, logger: logger, server: server, db: pool, shutdownTimeout: cfg.ShutdownTimeout}, nil
++}
++
++func NewGameGRPCService(ctx context.Context, cfg config.Config, logger *slog.Logger) (*GRPCServiceApp, error) {
++	pool, err := openDatabase(ctx, cfg.DatabaseURL)
++	if err != nil {
++		return nil, err
++	}
++	hub := realtime.NewHub(realtime.DefaultBufferSize)
++	advice, err := newAdviceGenerator(cfg)
++	if err != nil {
++		pool.Close()
++		return nil, fmt.Errorf("create advice generator: %w", err)
++	}
++	game := newGameService(pool, postgres.NewTxManager(pool), hub, advice)
++	server := grpc.NewServer()
++	avitoshav1.RegisterGameServiceServer(server, gameserver.New(game, hub))
++	registerHealth(server)
++	return &GRPCServiceApp{name: "game-service", addr: cfg.GRPCAddr, logger: logger, server: server, db: pool, shutdownTimeout: cfg.ShutdownTimeout}, nil
++}
++
++func (a *GRPCServiceApp) Run(ctx context.Context) error {
++	listener, err := net.Listen("tcp", a.addr)
++	if err != nil {
++		return fmt.Errorf("listen %s: %w", a.name, err)
++	}
++	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
++	defer stop()
++	defer a.db.Close()
++	errChannel := make(chan error, 1)
++	go func() {
++		a.logger.Info(a.name+" started", "addr", a.addr)
++		errChannel <- a.server.Serve(listener)
++	}()
++	select {
++	case err := <-errChannel:
++		if err != nil {
++			return fmt.Errorf("serve %s: %w", a.name, err)
++		}
++		return nil
++	case <-runCtx.Done():
++	}
++	stopped := make(chan struct{})
++	go func() { a.server.GracefulStop(); close(stopped) }()
++	select {
++	case <-stopped:
++	case <-time.After(a.shutdownTimeout):
++		a.server.Stop()
++	}
++	return <-errChannel
++}
++
++type grpcServicesPinger []healthv1.HealthClient
++
++func (clients grpcServicesPinger) Ping(ctx context.Context) error {
++	for _, client := range clients {
++		response, err := client.Check(ctx, &healthv1.HealthCheckRequest{})
++		if err != nil || response.GetStatus() != healthv1.HealthCheckResponse_SERVING {
++			if err != nil {
++				return err
++			}
++			return fmt.Errorf("grpc service is not serving")
++		}
++	}
++	return nil
++}
++
++func openDatabase(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
++	pool, err := postgres.NewPool(ctx, databaseURL)
++	if err != nil {
++		return nil, fmt.Errorf("open database: %w", err)
++	}
++	pingCtx, cancel := context.WithTimeout(ctx, startupDatabasePingTimeout)
++	defer cancel()
++	if err := pool.Ping(pingCtx); err != nil {
++		pool.Close()
++		return nil, fmt.Errorf("ping database: %w", err)
++	}
++	return pool, nil
++}
++
++func registerHealth(server *grpc.Server) {
++	healthServer := health.NewServer()
++	healthServer.SetServingStatus("", healthv1.HealthCheckResponse_SERVING)
++	healthv1.RegisterHealthServer(server, healthServer)
++}
++
++func defaultUnaryDeadline(
++	ctx context.Context,
++	method string,
++	request, response any,
++	connection *grpc.ClientConn,
++	invoke grpc.UnaryInvoker,
++	options ...grpc.CallOption,
++) error {
++	if _, exists := ctx.Deadline(); exists {
++		return invoke(ctx, method, request, response, connection, options...)
++	}
++	deadlineContext, cancel := context.WithTimeout(ctx, downstreamUnaryTimeout)
++	defer cancel()
++	return invoke(deadlineContext, method, request, response, connection, options...)
++}
+diff --git a/app/backend/internal/client/grpc/authclient/client.go b/app/backend/internal/client/grpc/authclient/client.go
+new file mode 100644
+index 0000000..07af22b
+--- /dev/null
++++ b/app/backend/internal/client/grpc/authclient/client.go
+@@ -0,0 +1,113 @@
++package authclient
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/google/uuid"
++	avitoshav1 "github.com/guitaramust-sudo/Avitosha/app/backend/internal/gen/avitosha/v1"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/model"
++	internalrpc "github.com/guitaramust-sudo/Avitosha/app/backend/internal/rpc"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/usecase"
++)
++
++type Client struct{ rpc avitoshav1.AuthServiceClient }
++
++func New(rpc avitoshav1.AuthServiceClient) *Client { return &Client{rpc: rpc} }
++
++func (c *Client) Register(ctx context.Context, params usecase.RegisterParams) (usecase.AuthenticationResult, error) {
++	response, err := c.rpc.Register(ctx, &avitoshav1.RegisterRequest{
++		Email: params.Email, Password: params.Password, UserAgent: stringValue(params.UserAgent),
++	})
++	if err != nil {
++		return usecase.AuthenticationResult{}, fmt.Errorf("register over grpc: %w", internalrpc.DecodeAuthError(err))
++	}
++	user, err := parseUser(response.GetUser())
++	if err != nil {
++		return usecase.AuthenticationResult{}, err
++	}
++	return usecase.AuthenticationResult{User: user, AccessToken: response.GetAccessToken(), RefreshToken: response.GetRefreshToken()}, nil
++}
++
++func (c *Client) Login(ctx context.Context, params usecase.LoginParams) (usecase.AuthenticationResult, error) {
++	response, err := c.rpc.Login(ctx, &avitoshav1.LoginRequest{
++		Email: params.Email, Password: params.Password, UserAgent: stringValue(params.UserAgent),
++	})
++	if err != nil {
++		return usecase.AuthenticationResult{}, fmt.Errorf("login over grpc: %w", internalrpc.DecodeAuthError(err))
++	}
++	user, err := parseUser(response.GetUser())
++	if err != nil {
++		return usecase.AuthenticationResult{}, err
++	}
++	return usecase.AuthenticationResult{User: user, AccessToken: response.GetAccessToken(), RefreshToken: response.GetRefreshToken()}, nil
++}
++
++func (c *Client) Refresh(ctx context.Context, params usecase.RefreshParams) (usecase.RefreshResult, error) {
++	response, err := c.rpc.Refresh(ctx, &avitoshav1.RefreshRequest{RefreshToken: params.RefreshToken})
++	if err != nil {
++		return usecase.RefreshResult{}, fmt.Errorf("refresh over grpc: %w", internalrpc.DecodeAuthError(err))
++	}
++	return usecase.RefreshResult{AccessToken: response.GetAccessToken(), RefreshToken: response.GetRefreshToken()}, nil
++}
++
++func (c *Client) Logout(ctx context.Context, params usecase.LogoutParams) error {
++	_, err := c.rpc.Logout(ctx, &avitoshav1.LogoutRequest{RefreshToken: params.RefreshToken})
++	if err != nil {
++		return fmt.Errorf("logout over grpc: %w", internalrpc.DecodeAuthError(err))
++	}
++	return nil
++}
++
++func (c *Client) GetCurrentUser(ctx context.Context, params usecase.GetCurrentUserParams) (model.User, error) {
++	response, err := c.rpc.GetCurrentUser(ctx, &avitoshav1.GetCurrentUserRequest{
++		UserId: params.AuthenticatedUser.UserID.String(), SessionId: params.AuthenticatedUser.SessionID.String(),
++	})
++	if err != nil {
++		return model.User{}, fmt.Errorf("get current user over grpc: %w", internalrpc.DecodeAuthError(err))
++	}
++	return parseUser(response.GetUser())
++}
++
++func (c *Client) AuthenticateAccessToken(ctx context.Context, token string) (model.AuthenticatedUser, error) {
++	response, err := c.rpc.AuthenticateAccessToken(ctx, &avitoshav1.AuthenticateAccessTokenRequest{AccessToken: token})
++	if err != nil {
++		return model.AuthenticatedUser{}, fmt.Errorf("authenticate access token over grpc: %w", internalrpc.DecodeAuthError(err))
++	}
++	userID, err := uuid.Parse(response.GetUserId())
++	if err != nil {
++		return model.AuthenticatedUser{}, fmt.Errorf("authenticate access token over grpc: invalid user id: %w", usecase.ErrInternal)
++	}
++	sessionID, err := uuid.Parse(response.GetSessionId())
++	if err != nil {
++		return model.AuthenticatedUser{}, fmt.Errorf("authenticate access token over grpc: invalid session id: %w", usecase.ErrInternal)
++	}
++	return model.AuthenticatedUser{UserID: userID, SessionID: sessionID}, nil
++}
++
++func parseUser(message *avitoshav1.User) (model.User, error) {
++	if message == nil {
++		return model.User{}, fmt.Errorf("decode auth grpc response: missing user: %w", usecase.ErrInternal)
++	}
++	id, err := uuid.Parse(message.GetId())
++	if err != nil {
++		return model.User{}, fmt.Errorf("decode auth grpc response: invalid user id: %w", usecase.ErrInternal)
++	}
++	createdAt, err := time.Parse(time.RFC3339Nano, message.GetCreatedAt())
++	if err != nil {
++		return model.User{}, fmt.Errorf("decode auth grpc response: invalid created_at: %w", usecase.ErrInternal)
++	}
++	updatedAt, err := time.Parse(time.RFC3339Nano, message.GetUpdatedAt())
++	if err != nil {
++		return model.User{}, fmt.Errorf("decode auth grpc response: invalid updated_at: %w", usecase.ErrInternal)
++	}
++	return model.User{ID: id, Email: message.GetEmail(), CreatedAt: createdAt, UpdatedAt: updatedAt}, nil
++}
++
++func stringValue(value *string) string {
++	if value == nil {
++		return ""
++	}
++	return *value
++}
+diff --git a/app/backend/internal/client/grpc/gameclient/client.go b/app/backend/internal/client/grpc/gameclient/client.go
+new file mode 100644
+index 0000000..5305e08
+--- /dev/null
++++ b/app/backend/internal/client/grpc/gameclient/client.go
+@@ -0,0 +1,158 @@
++package gameclient
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"sync"
++	"time"
++
++	"github.com/google/uuid"
++	avitoshav1 "github.com/guitaramust-sudo/Avitosha/app/backend/internal/gen/avitosha/v1"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/model"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/realtime"
++	internalrpc "github.com/guitaramust-sudo/Avitosha/app/backend/internal/rpc"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/usecase"
++)
++
++type Client struct{ rpc avitoshav1.GameServiceClient }
++
++func New(rpc avitoshav1.GameServiceClient) *Client { return &Client{rpc: rpc} }
++
++func (c *Client) EnsureProfile(ctx context.Context, userID uuid.UUID, at time.Time) (usecase.GameProfile, error) {
++	response, err := c.rpc.EnsureProfile(ctx, userAt(userID, at))
++	return decode[usecase.GameProfile](response, err)
++}
++
++func (c *Client) RenamePet(ctx context.Context, userID uuid.UUID, name string, at time.Time) (usecase.GameProfile, error) {
++	response, err := c.rpc.RenamePet(ctx, &avitoshav1.RenamePetRequest{UserId: userID.String(), Name: name, At: formatTime(at)})
++	return decode[usecase.GameProfile](response, err)
++}
++
++func (c *Client) ListTasks(ctx context.Context, userID uuid.UUID, at time.Time) ([]model.TaskProgress, error) {
++	response, err := c.rpc.ListTasks(ctx, userAt(userID, at))
++	return decode[[]model.TaskProgress](response, err)
++}
++
++func (c *Client) GetTask(ctx context.Context, userID, taskID uuid.UUID, at time.Time) (model.TaskProgress, error) {
++	response, err := c.rpc.GetTask(ctx, taskRequest(userID, taskID, at))
++	return decode[model.TaskProgress](response, err)
++}
++
++func (c *Client) GetTaskAdvice(ctx context.Context, userID, taskID uuid.UUID, at time.Time) (usecase.TaskAdvice, error) {
++	response, err := c.rpc.GetTaskAdvice(ctx, taskRequest(userID, taskID, at))
++	return decode[usecase.TaskAdvice](response, err)
++}
++
++func (c *Client) GetRoom(ctx context.Context, userID uuid.UUID, at time.Time) ([]model.RoomItemProgress, error) {
++	response, err := c.rpc.GetRoom(ctx, userAt(userID, at))
++	return decode[[]model.RoomItemProgress](response, err)
++}
++
++func (c *Client) GetStory(ctx context.Context, userID uuid.UUID, at time.Time) (model.StorySnapshot, error) {
++	response, err := c.rpc.GetStory(ctx, userAt(userID, at))
++	return decode[model.StorySnapshot](response, err)
++}
++
++func (c *Client) GetDailySummary(ctx context.Context, userID uuid.UUID, at time.Time) (usecase.DailySummary, error) {
++	response, err := c.rpc.GetDailySummary(ctx, userAt(userID, at))
++	return decode[usecase.DailySummary](response, err)
++}
++
++func (c *Client) GetLeaderboard(ctx context.Context, userID uuid.UUID, limit int, at time.Time) (usecase.Leaderboard, error) {
++	response, err := c.rpc.GetLeaderboard(ctx, &avitoshav1.LeaderboardRequest{UserId: userID.String(), Limit: int32(limit), At: formatTime(at)})
++	return decode[usecase.Leaderboard](response, err)
++}
++
++func (c *Client) GetAchievements(ctx context.Context, userID uuid.UUID, at time.Time) ([]model.AchievementProgress, error) {
++	response, err := c.rpc.GetAchievements(ctx, userAt(userID, at))
++	return decode[[]model.AchievementProgress](response, err)
++}
++
++func (c *Client) GetRewardBalances(ctx context.Context, userID uuid.UUID, at time.Time) ([]model.RewardBalance, error) {
++	response, err := c.rpc.GetRewardBalances(ctx, userAt(userID, at))
++	return decode[[]model.RewardBalance](response, err)
++}
++
++func (c *Client) GetRewardWallet(ctx context.Context, userID uuid.UUID, at time.Time) (usecase.RewardWallet, error) {
++	response, err := c.rpc.GetRewardWallet(ctx, userAt(userID, at))
++	return decode[usecase.RewardWallet](response, err)
++}
++
++func (c *Client) ProcessAction(ctx context.Context, command usecase.ProcessActionCommand) (usecase.ProcessActionResult, error) {
++	request := &avitoshav1.ProcessActionRequest{
++		UserId: command.UserID.String(), EventId: command.EventID.String(), ActionType: string(command.ActionType),
++		EntityId: command.EntityID, Category: command.Category, MetadataJson: command.Metadata,
++		OccurredAt: formatTime(command.OccurredAt), Now: formatTime(command.Now),
++	}
++	response, err := c.rpc.ProcessAction(ctx, request)
++	return decode[usecase.ProcessActionResult](response, err)
++}
++
++func (c *Client) Subscribe(userID uuid.UUID) realtime.EventSubscription {
++	ctx, cancel := context.WithCancel(context.Background())
++	subscription := &interfaceSubscription{messages: make(chan []model.DomainEvent, 16), cancel: cancel}
++	stream, err := c.rpc.SubscribeEvents(ctx, &avitoshav1.SubscribeEventsRequest{UserId: userID.String()})
++	if err != nil {
++		close(subscription.messages)
++		return subscription
++	}
++	go subscription.receive(stream)
++	return subscription
++}
++
++// interfaceSubscription is returned by value so every WebSocket owns one
++// independent gRPC stream. Close remains idempotent through sync.Once.
++type interfaceSubscription struct {
++	messages chan []model.DomainEvent
++	cancel   context.CancelFunc
++	once     sync.Once
++}
++
++func (s *interfaceSubscription) Messages() <-chan []model.DomainEvent { return s.messages }
++func (s *interfaceSubscription) Close()                               { s.once.Do(s.cancel) }
++
++func (s *interfaceSubscription) receive(stream avitoshav1.GameService_SubscribeEventsClient) {
++	defer close(s.messages)
++	for {
++		batch, err := stream.Recv()
++		if err != nil {
++			if err != io.EOF {
++				s.cancel()
++			}
++			return
++		}
++		var events []model.DomainEvent
++		if json.Unmarshal(batch.GetPayloadJson(), &events) != nil {
++			s.cancel()
++			return
++		}
++		select {
++		case s.messages <- events:
++		case <-stream.Context().Done():
++			return
++		}
++	}
++}
++
++func decode[T any](response *avitoshav1.JsonResponse, err error) (T, error) {
++	var value T
++	if err != nil {
++		return value, fmt.Errorf("game grpc request: %w", internalrpc.DecodeGameError(err))
++	}
++	if response == nil || json.Unmarshal(response.GetPayloadJson(), &value) != nil {
++		return value, fmt.Errorf("decode game grpc response: %w", usecase.ErrUnexpectedStorage)
++	}
++	return value, nil
++}
++
++func userAt(userID uuid.UUID, at time.Time) *avitoshav1.UserAtRequest {
++	return &avitoshav1.UserAtRequest{UserId: userID.String(), At: formatTime(at)}
++}
++
++func taskRequest(userID, taskID uuid.UUID, at time.Time) *avitoshav1.TaskRequest {
++	return &avitoshav1.TaskRequest{UserId: userID.String(), TaskId: taskID.String(), At: formatTime(at)}
++}
++
++func formatTime(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) }
+diff --git a/app/backend/internal/config/config.go b/app/backend/internal/config/config.go
+index dd6f497..24dd031 100644
+--- a/app/backend/internal/config/config.go
++++ b/app/backend/internal/config/config.go
+@@ -46,13 +46,32 @@ type Config struct {
+ 	ProxyAPIBaseURL  string
+ 	ProxyAPIModel    string
+ 	ProxyAPITimeout  time.Duration
++	GRPCAddr         string
++	AuthGRPCAddr     string
++	GameGRPCAddr     string
+ }
+ 
+ func Load() (Config, error) {
+ 	return LoadFromEnv(os.Getenv)
+ }
+ 
++func LoadGateway() (Config, error) {
++	return loadForRole(os.Getenv, Config.ValidateGateway)
++}
++
++func LoadAuthService() (Config, error) {
++	return loadForRole(os.Getenv, Config.ValidateAuthService)
++}
++
++func LoadGameService() (Config, error) {
++	return loadForRole(os.Getenv, Config.ValidateGameService)
++}
++
+ func LoadFromEnv(getenv func(string) string) (Config, error) {
++	return loadForRole(getenv, Config.Validate)
++}
++
++func loadForRole(getenv func(string) string, validate func(Config) error) (Config, error) {
+ 	cfg := Config{
+ 		AppEnv:           envOrDefault(getenv, "APP_ENV", AppEnvDev),
+ 		HTTPAddr:         strings.TrimSpace(getenv("HTTP_ADDR")),
+@@ -72,6 +91,9 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
+ 		ProxyAPIBaseURL:  envOrDefault(getenv, "PROXYAPI_BASE_URL", defaultProxyAPIBaseURL),
+ 		ProxyAPIModel:    envOrDefault(getenv, "PROXYAPI_MODEL", defaultProxyAPIModel),
+ 		ProxyAPITimeout:  defaultProxyAPITimeout,
++		GRPCAddr:         envOrDefault(getenv, "GRPC_ADDR", ":9090"),
++		AuthGRPCAddr:     envOrDefault(getenv, "AUTH_GRPC_ADDR", "127.0.0.1:9091"),
++		GameGRPCAddr:     envOrDefault(getenv, "GAME_GRPC_ADDR", "127.0.0.1:9092"),
+ 	}
+ 
+ 	if value := strings.TrimSpace(getenv("SHUTDOWN_TIMEOUT")); value != "" {
+@@ -103,13 +125,90 @@ func LoadFromEnv(getenv func(string) string) (Config, error) {
+ 		cfg.ProxyAPITimeout = timeout
+ 	}
+ 
+-	if err := cfg.Validate(); err != nil {
++	if err := validate(cfg); err != nil {
+ 		return Config{}, err
+ 	}
+ 
+ 	return cfg, nil
+ }
+ 
++func (cfg Config) ValidateGateway() error {
++	if err := cfg.validateRuntime(); err != nil {
++		return err
++	}
++	if cfg.HTTPAddr == "" {
++		return fmt.Errorf("HTTP_ADDR is required")
++	}
++	if cfg.FrontendOrigin == "" {
++		return fmt.Errorf("FRONTEND_ORIGIN is required")
++	}
++	if cfg.RefreshTokenTTL <= 0 {
++		return fmt.Errorf("REFRESH_TOKEN_TTL must be positive")
++	}
++	if cfg.AuthGRPCAddr == "" || cfg.GameGRPCAddr == "" {
++		return fmt.Errorf("AUTH_GRPC_ADDR and GAME_GRPC_ADDR must not be empty")
++	}
++	return nil
++}
++
++func (cfg Config) ValidateAuthService() error {
++	if err := cfg.validateRuntime(); err != nil {
++		return err
++	}
++	if cfg.DatabaseURL == "" {
++		return fmt.Errorf("DATABASE_URL is required")
++	}
++	if cfg.JWTSigningKey == "" {
++		return fmt.Errorf("JWT_SIGNING_KEY is required")
++	}
++	if cfg.JWTIssuer == "" {
++		return fmt.Errorf("JWT_ISSUER is required")
++	}
++	if cfg.JWTAudience == "" {
++		return fmt.Errorf("JWT_AUDIENCE is required")
++	}
++	if cfg.AccessTokenTTL <= 0 || cfg.RefreshTokenTTL <= 0 {
++		return fmt.Errorf("ACCESS_TOKEN_TTL and REFRESH_TOKEN_TTL must be positive")
++	}
++	if cfg.GRPCAddr == "" {
++		return fmt.Errorf("GRPC_ADDR must not be empty")
++	}
++	return nil
++}
++
++func (cfg Config) ValidateGameService() error {
++	if err := cfg.validateRuntime(); err != nil {
++		return err
++	}
++	if cfg.DatabaseURL == "" {
++		return fmt.Errorf("DATABASE_URL is required")
++	}
++	if cfg.GRPCAddr == "" {
++		return fmt.Errorf("GRPC_ADDR must not be empty")
++	}
++	if cfg.ProxyAPIBaseURL == "" || cfg.ProxyAPIModel == "" || cfg.ProxyAPITimeout <= 0 {
++		return fmt.Errorf("ProxyAPI URL/model must not be empty and timeout must be positive")
++	}
++	return nil
++}
++
++func (cfg Config) validateRuntime() error {
++	switch cfg.AppEnv {
++	case AppEnvDev, AppEnvTest, AppEnvProd:
++	default:
++		return fmt.Errorf("APP_ENV must be one of: dev, test, prod")
++	}
++	switch cfg.LogLevel {
++	case LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError:
++	default:
++		return fmt.Errorf("LOG_LEVEL must be one of: debug, info, warn, error")
++	}
++	if cfg.ShutdownTimeout <= 0 {
++		return fmt.Errorf("SHUTDOWN_TIMEOUT must be positive")
++	}
++	return nil
++}
++
+ func (cfg Config) Validate() error {
+ 	if cfg.HTTPAddr == "" {
+ 		return fmt.Errorf("HTTP_ADDR is required")
+@@ -160,6 +259,9 @@ func (cfg Config) Validate() error {
+ 	if cfg.ProxyAPITimeout <= 0 {
+ 		return fmt.Errorf("PROXYAPI_TIMEOUT must be positive")
+ 	}
++	if cfg.GRPCAddr == "" || cfg.AuthGRPCAddr == "" || cfg.GameGRPCAddr == "" {
++		return fmt.Errorf("GRPC_ADDR, AUTH_GRPC_ADDR and GAME_GRPC_ADDR must not be empty")
++	}
+ 
+ 	return nil
+ }
+diff --git a/app/backend/internal/config/config_test.go b/app/backend/internal/config/config_test.go
+index c561154..d0c2f06 100644
+--- a/app/backend/internal/config/config_test.go
++++ b/app/backend/internal/config/config_test.go
+@@ -237,6 +237,49 @@ func TestLoadFromEnvRequiresJWTConfig(t *testing.T) {
+ 	}
+ }
+ 
++func TestRoleValidationKeepsSecretsScopedToOwningService(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name     string
++		env      map[string]string
++		validate func(Config) error
++	}{
++		{
++			name: "gateway does not need database or JWT",
++			env: map[string]string{
++				"HTTP_ADDR": ":8080", "FRONTEND_ORIGIN": "http://localhost:3000",
++				"AUTH_GRPC_ADDR": "auth:9091", "GAME_GRPC_ADDR": "game:9092",
++			},
++			validate: Config.ValidateGateway,
++		},
++		{
++			name: "auth does not need HTTP or ProxyAPI key",
++			env: map[string]string{
++				"DATABASE_URL": "postgres://auth", "GRPC_ADDR": ":9091",
++				"JWT_SIGNING_KEY": "secret", "JWT_ISSUER": "avitosha", "JWT_AUDIENCE": "web",
++			},
++			validate: Config.ValidateAuthService,
++		},
++		{
++			name: "game does not need HTTP or JWT",
++			env: map[string]string{
++				"DATABASE_URL": "postgres://game", "GRPC_ADDR": ":9092",
++			},
++			validate: Config.ValidateGameService,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			t.Parallel()
++			if _, err := loadForRole(mapGetter(test.env), test.validate); err != nil {
++				t.Fatalf("loadForRole() error = %v", err)
++			}
++		})
++	}
++}
++
+ func mapGetter(values map[string]string) func(string) string {
+ 	return func(key string) string {
+ 		return values[key]
+diff --git a/app/backend/internal/gen/avitosha/v1/services.pb.go b/app/backend/internal/gen/avitosha/v1/services.pb.go
+new file mode 100644
+index 0000000..a3c361c
+--- /dev/null
++++ b/app/backend/internal/gen/avitosha/v1/services.pb.go
+@@ -0,0 +1,1731 @@
++// Code generated by protoc-gen-go. DO NOT EDIT.
++// versions:
++// 	protoc-gen-go v1.34.1
++// 	protoc        (unknown)
++// source: avitosha/v1/services.proto
++
++package avitoshav1
++
++import (
++	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
++	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
++	reflect "reflect"
++	sync "sync"
++)
++
++const (
++	// Verify that this generated code is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
++	// Verify that runtime/protoimpl is sufficiently up-to-date.
++	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
++)
++
++type Empty struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++}
++
++func (x *Empty) Reset() {
++	*x = Empty{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[0]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *Empty) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*Empty) ProtoMessage() {}
++
++func (x *Empty) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[0]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use Empty.ProtoReflect.Descriptor instead.
++func (*Empty) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{0}
++}
++
++type RegisterRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Email     string `protobuf:"bytes,1,opt,name=email,proto3" json:"email,omitempty"`
++	Password  string `protobuf:"bytes,2,opt,name=password,proto3" json:"password,omitempty"`
++	UserAgent string `protobuf:"bytes,3,opt,name=user_agent,json=userAgent,proto3" json:"user_agent,omitempty"`
++}
++
++func (x *RegisterRequest) Reset() {
++	*x = RegisterRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[1]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RegisterRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RegisterRequest) ProtoMessage() {}
++
++func (x *RegisterRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[1]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RegisterRequest.ProtoReflect.Descriptor instead.
++func (*RegisterRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{1}
++}
++
++func (x *RegisterRequest) GetEmail() string {
++	if x != nil {
++		return x.Email
++	}
++	return ""
++}
++
++func (x *RegisterRequest) GetPassword() string {
++	if x != nil {
++		return x.Password
++	}
++	return ""
++}
++
++func (x *RegisterRequest) GetUserAgent() string {
++	if x != nil {
++		return x.UserAgent
++	}
++	return ""
++}
++
++type LoginRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Email     string `protobuf:"bytes,1,opt,name=email,proto3" json:"email,omitempty"`
++	Password  string `protobuf:"bytes,2,opt,name=password,proto3" json:"password,omitempty"`
++	UserAgent string `protobuf:"bytes,3,opt,name=user_agent,json=userAgent,proto3" json:"user_agent,omitempty"`
++}
++
++func (x *LoginRequest) Reset() {
++	*x = LoginRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[2]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *LoginRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*LoginRequest) ProtoMessage() {}
++
++func (x *LoginRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[2]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use LoginRequest.ProtoReflect.Descriptor instead.
++func (*LoginRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{2}
++}
++
++func (x *LoginRequest) GetEmail() string {
++	if x != nil {
++		return x.Email
++	}
++	return ""
++}
++
++func (x *LoginRequest) GetPassword() string {
++	if x != nil {
++		return x.Password
++	}
++	return ""
++}
++
++func (x *LoginRequest) GetUserAgent() string {
++	if x != nil {
++		return x.UserAgent
++	}
++	return ""
++}
++
++type RefreshRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	RefreshToken string `protobuf:"bytes,1,opt,name=refresh_token,json=refreshToken,proto3" json:"refresh_token,omitempty"`
++}
++
++func (x *RefreshRequest) Reset() {
++	*x = RefreshRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[3]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RefreshRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RefreshRequest) ProtoMessage() {}
++
++func (x *RefreshRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[3]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RefreshRequest.ProtoReflect.Descriptor instead.
++func (*RefreshRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{3}
++}
++
++func (x *RefreshRequest) GetRefreshToken() string {
++	if x != nil {
++		return x.RefreshToken
++	}
++	return ""
++}
++
++type LogoutRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	RefreshToken string `protobuf:"bytes,1,opt,name=refresh_token,json=refreshToken,proto3" json:"refresh_token,omitempty"`
++}
++
++func (x *LogoutRequest) Reset() {
++	*x = LogoutRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[4]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *LogoutRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*LogoutRequest) ProtoMessage() {}
++
++func (x *LogoutRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[4]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use LogoutRequest.ProtoReflect.Descriptor instead.
++func (*LogoutRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{4}
++}
++
++func (x *LogoutRequest) GetRefreshToken() string {
++	if x != nil {
++		return x.RefreshToken
++	}
++	return ""
++}
++
++type GetCurrentUserRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	UserId    string `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
++	SessionId string `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
++}
++
++func (x *GetCurrentUserRequest) Reset() {
++	*x = GetCurrentUserRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[5]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *GetCurrentUserRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*GetCurrentUserRequest) ProtoMessage() {}
++
++func (x *GetCurrentUserRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[5]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use GetCurrentUserRequest.ProtoReflect.Descriptor instead.
++func (*GetCurrentUserRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{5}
++}
++
++func (x *GetCurrentUserRequest) GetUserId() string {
++	if x != nil {
++		return x.UserId
++	}
++	return ""
++}
++
++func (x *GetCurrentUserRequest) GetSessionId() string {
++	if x != nil {
++		return x.SessionId
++	}
++	return ""
++}
++
++type AuthenticateAccessTokenRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	AccessToken string `protobuf:"bytes,1,opt,name=access_token,json=accessToken,proto3" json:"access_token,omitempty"`
++}
++
++func (x *AuthenticateAccessTokenRequest) Reset() {
++	*x = AuthenticateAccessTokenRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[6]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AuthenticateAccessTokenRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AuthenticateAccessTokenRequest) ProtoMessage() {}
++
++func (x *AuthenticateAccessTokenRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[6]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AuthenticateAccessTokenRequest.ProtoReflect.Descriptor instead.
++func (*AuthenticateAccessTokenRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{6}
++}
++
++func (x *AuthenticateAccessTokenRequest) GetAccessToken() string {
++	if x != nil {
++		return x.AccessToken
++	}
++	return ""
++}
++
++type User struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	Id        string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
++	Email     string `protobuf:"bytes,2,opt,name=email,proto3" json:"email,omitempty"`
++	CreatedAt string `protobuf:"bytes,3,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
++	UpdatedAt string `protobuf:"bytes,4,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
++}
++
++func (x *User) Reset() {
++	*x = User{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[7]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *User) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*User) ProtoMessage() {}
++
++func (x *User) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[7]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use User.ProtoReflect.Descriptor instead.
++func (*User) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{7}
++}
++
++func (x *User) GetId() string {
++	if x != nil {
++		return x.Id
++	}
++	return ""
++}
++
++func (x *User) GetEmail() string {
++	if x != nil {
++		return x.Email
++	}
++	return ""
++}
++
++func (x *User) GetCreatedAt() string {
++	if x != nil {
++		return x.CreatedAt
++	}
++	return ""
++}
++
++func (x *User) GetUpdatedAt() string {
++	if x != nil {
++		return x.UpdatedAt
++	}
++	return ""
++}
++
++type AuthenticationResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	User         *User  `protobuf:"bytes,1,opt,name=user,proto3" json:"user,omitempty"`
++	AccessToken  string `protobuf:"bytes,2,opt,name=access_token,json=accessToken,proto3" json:"access_token,omitempty"`
++	RefreshToken string `protobuf:"bytes,3,opt,name=refresh_token,json=refreshToken,proto3" json:"refresh_token,omitempty"`
++}
++
++func (x *AuthenticationResponse) Reset() {
++	*x = AuthenticationResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[8]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AuthenticationResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AuthenticationResponse) ProtoMessage() {}
++
++func (x *AuthenticationResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[8]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AuthenticationResponse.ProtoReflect.Descriptor instead.
++func (*AuthenticationResponse) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{8}
++}
++
++func (x *AuthenticationResponse) GetUser() *User {
++	if x != nil {
++		return x.User
++	}
++	return nil
++}
++
++func (x *AuthenticationResponse) GetAccessToken() string {
++	if x != nil {
++		return x.AccessToken
++	}
++	return ""
++}
++
++func (x *AuthenticationResponse) GetRefreshToken() string {
++	if x != nil {
++		return x.RefreshToken
++	}
++	return ""
++}
++
++type RefreshResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	AccessToken  string `protobuf:"bytes,1,opt,name=access_token,json=accessToken,proto3" json:"access_token,omitempty"`
++	RefreshToken string `protobuf:"bytes,2,opt,name=refresh_token,json=refreshToken,proto3" json:"refresh_token,omitempty"`
++}
++
++func (x *RefreshResponse) Reset() {
++	*x = RefreshResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[9]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RefreshResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RefreshResponse) ProtoMessage() {}
++
++func (x *RefreshResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[9]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RefreshResponse.ProtoReflect.Descriptor instead.
++func (*RefreshResponse) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{9}
++}
++
++func (x *RefreshResponse) GetAccessToken() string {
++	if x != nil {
++		return x.AccessToken
++	}
++	return ""
++}
++
++func (x *RefreshResponse) GetRefreshToken() string {
++	if x != nil {
++		return x.RefreshToken
++	}
++	return ""
++}
++
++type UserResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	User *User `protobuf:"bytes,1,opt,name=user,proto3" json:"user,omitempty"`
++}
++
++func (x *UserResponse) Reset() {
++	*x = UserResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[10]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *UserResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*UserResponse) ProtoMessage() {}
++
++func (x *UserResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[10]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use UserResponse.ProtoReflect.Descriptor instead.
++func (*UserResponse) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{10}
++}
++
++func (x *UserResponse) GetUser() *User {
++	if x != nil {
++		return x.User
++	}
++	return nil
++}
++
++type AuthenticatedUserResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	UserId    string `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
++	SessionId string `protobuf:"bytes,2,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
++}
++
++func (x *AuthenticatedUserResponse) Reset() {
++	*x = AuthenticatedUserResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[11]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *AuthenticatedUserResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*AuthenticatedUserResponse) ProtoMessage() {}
++
++func (x *AuthenticatedUserResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[11]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use AuthenticatedUserResponse.ProtoReflect.Descriptor instead.
++func (*AuthenticatedUserResponse) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{11}
++}
++
++func (x *AuthenticatedUserResponse) GetUserId() string {
++	if x != nil {
++		return x.UserId
++	}
++	return ""
++}
++
++func (x *AuthenticatedUserResponse) GetSessionId() string {
++	if x != nil {
++		return x.SessionId
++	}
++	return ""
++}
++
++type UserAtRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	UserId string `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
++	At     string `protobuf:"bytes,2,opt,name=at,proto3" json:"at,omitempty"`
++}
++
++func (x *UserAtRequest) Reset() {
++	*x = UserAtRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[12]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *UserAtRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*UserAtRequest) ProtoMessage() {}
++
++func (x *UserAtRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[12]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use UserAtRequest.ProtoReflect.Descriptor instead.
++func (*UserAtRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{12}
++}
++
++func (x *UserAtRequest) GetUserId() string {
++	if x != nil {
++		return x.UserId
++	}
++	return ""
++}
++
++func (x *UserAtRequest) GetAt() string {
++	if x != nil {
++		return x.At
++	}
++	return ""
++}
++
++type RenamePetRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	UserId string `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
++	Name   string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
++	At     string `protobuf:"bytes,3,opt,name=at,proto3" json:"at,omitempty"`
++}
++
++func (x *RenamePetRequest) Reset() {
++	*x = RenamePetRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[13]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *RenamePetRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*RenamePetRequest) ProtoMessage() {}
++
++func (x *RenamePetRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[13]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use RenamePetRequest.ProtoReflect.Descriptor instead.
++func (*RenamePetRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{13}
++}
++
++func (x *RenamePetRequest) GetUserId() string {
++	if x != nil {
++		return x.UserId
++	}
++	return ""
++}
++
++func (x *RenamePetRequest) GetName() string {
++	if x != nil {
++		return x.Name
++	}
++	return ""
++}
++
++func (x *RenamePetRequest) GetAt() string {
++	if x != nil {
++		return x.At
++	}
++	return ""
++}
++
++type TaskRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	UserId string `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
++	TaskId string `protobuf:"bytes,2,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
++	At     string `protobuf:"bytes,3,opt,name=at,proto3" json:"at,omitempty"`
++}
++
++func (x *TaskRequest) Reset() {
++	*x = TaskRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[14]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *TaskRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*TaskRequest) ProtoMessage() {}
++
++func (x *TaskRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[14]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use TaskRequest.ProtoReflect.Descriptor instead.
++func (*TaskRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{14}
++}
++
++func (x *TaskRequest) GetUserId() string {
++	if x != nil {
++		return x.UserId
++	}
++	return ""
++}
++
++func (x *TaskRequest) GetTaskId() string {
++	if x != nil {
++		return x.TaskId
++	}
++	return ""
++}
++
++func (x *TaskRequest) GetAt() string {
++	if x != nil {
++		return x.At
++	}
++	return ""
++}
++
++type LeaderboardRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	UserId string `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
++	Limit  int32  `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
++	At     string `protobuf:"bytes,3,opt,name=at,proto3" json:"at,omitempty"`
++}
++
++func (x *LeaderboardRequest) Reset() {
++	*x = LeaderboardRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[15]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *LeaderboardRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*LeaderboardRequest) ProtoMessage() {}
++
++func (x *LeaderboardRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[15]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use LeaderboardRequest.ProtoReflect.Descriptor instead.
++func (*LeaderboardRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{15}
++}
++
++func (x *LeaderboardRequest) GetUserId() string {
++	if x != nil {
++		return x.UserId
++	}
++	return ""
++}
++
++func (x *LeaderboardRequest) GetLimit() int32 {
++	if x != nil {
++		return x.Limit
++	}
++	return 0
++}
++
++func (x *LeaderboardRequest) GetAt() string {
++	if x != nil {
++		return x.At
++	}
++	return ""
++}
++
++type ProcessActionRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	UserId       string  `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
++	EventId      string  `protobuf:"bytes,2,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
++	ActionType   string  `protobuf:"bytes,3,opt,name=action_type,json=actionType,proto3" json:"action_type,omitempty"`
++	EntityId     *string `protobuf:"bytes,4,opt,name=entity_id,json=entityId,proto3,oneof" json:"entity_id,omitempty"`
++	Category     *string `protobuf:"bytes,5,opt,name=category,proto3,oneof" json:"category,omitempty"`
++	MetadataJson []byte  `protobuf:"bytes,6,opt,name=metadata_json,json=metadataJson,proto3" json:"metadata_json,omitempty"`
++	OccurredAt   string  `protobuf:"bytes,7,opt,name=occurred_at,json=occurredAt,proto3" json:"occurred_at,omitempty"`
++	Now          string  `protobuf:"bytes,8,opt,name=now,proto3" json:"now,omitempty"`
++}
++
++func (x *ProcessActionRequest) Reset() {
++	*x = ProcessActionRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[16]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *ProcessActionRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*ProcessActionRequest) ProtoMessage() {}
++
++func (x *ProcessActionRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[16]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use ProcessActionRequest.ProtoReflect.Descriptor instead.
++func (*ProcessActionRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{16}
++}
++
++func (x *ProcessActionRequest) GetUserId() string {
++	if x != nil {
++		return x.UserId
++	}
++	return ""
++}
++
++func (x *ProcessActionRequest) GetEventId() string {
++	if x != nil {
++		return x.EventId
++	}
++	return ""
++}
++
++func (x *ProcessActionRequest) GetActionType() string {
++	if x != nil {
++		return x.ActionType
++	}
++	return ""
++}
++
++func (x *ProcessActionRequest) GetEntityId() string {
++	if x != nil && x.EntityId != nil {
++		return *x.EntityId
++	}
++	return ""
++}
++
++func (x *ProcessActionRequest) GetCategory() string {
++	if x != nil && x.Category != nil {
++		return *x.Category
++	}
++	return ""
++}
++
++func (x *ProcessActionRequest) GetMetadataJson() []byte {
++	if x != nil {
++		return x.MetadataJson
++	}
++	return nil
++}
++
++func (x *ProcessActionRequest) GetOccurredAt() string {
++	if x != nil {
++		return x.OccurredAt
++	}
++	return ""
++}
++
++func (x *ProcessActionRequest) GetNow() string {
++	if x != nil {
++		return x.Now
++	}
++	return ""
++}
++
++// Each RPC is explicitly typed; payload_json is a temporary anti-corruption
++// envelope for the existing domain read models. It keeps JSON out of routing
++// and can be replaced message-by-message without changing HTTP clients.
++type JsonResponse struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	PayloadJson []byte `protobuf:"bytes,1,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`
++}
++
++func (x *JsonResponse) Reset() {
++	*x = JsonResponse{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[17]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *JsonResponse) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*JsonResponse) ProtoMessage() {}
++
++func (x *JsonResponse) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[17]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use JsonResponse.ProtoReflect.Descriptor instead.
++func (*JsonResponse) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{17}
++}
++
++func (x *JsonResponse) GetPayloadJson() []byte {
++	if x != nil {
++		return x.PayloadJson
++	}
++	return nil
++}
++
++type SubscribeEventsRequest struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	UserId string `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
++}
++
++func (x *SubscribeEventsRequest) Reset() {
++	*x = SubscribeEventsRequest{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[18]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *SubscribeEventsRequest) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*SubscribeEventsRequest) ProtoMessage() {}
++
++func (x *SubscribeEventsRequest) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[18]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use SubscribeEventsRequest.ProtoReflect.Descriptor instead.
++func (*SubscribeEventsRequest) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{18}
++}
++
++func (x *SubscribeEventsRequest) GetUserId() string {
++	if x != nil {
++		return x.UserId
++	}
++	return ""
++}
++
++type EventBatch struct {
++	state         protoimpl.MessageState
++	sizeCache     protoimpl.SizeCache
++	unknownFields protoimpl.UnknownFields
++
++	PayloadJson []byte `protobuf:"bytes,1,opt,name=payload_json,json=payloadJson,proto3" json:"payload_json,omitempty"`
++}
++
++func (x *EventBatch) Reset() {
++	*x = EventBatch{}
++	if protoimpl.UnsafeEnabled {
++		mi := &file_avitosha_v1_services_proto_msgTypes[19]
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		ms.StoreMessageInfo(mi)
++	}
++}
++
++func (x *EventBatch) String() string {
++	return protoimpl.X.MessageStringOf(x)
++}
++
++func (*EventBatch) ProtoMessage() {}
++
++func (x *EventBatch) ProtoReflect() protoreflect.Message {
++	mi := &file_avitosha_v1_services_proto_msgTypes[19]
++	if protoimpl.UnsafeEnabled && x != nil {
++		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
++		if ms.LoadMessageInfo() == nil {
++			ms.StoreMessageInfo(mi)
++		}
++		return ms
++	}
++	return mi.MessageOf(x)
++}
++
++// Deprecated: Use EventBatch.ProtoReflect.Descriptor instead.
++func (*EventBatch) Descriptor() ([]byte, []int) {
++	return file_avitosha_v1_services_proto_rawDescGZIP(), []int{19}
++}
++
++func (x *EventBatch) GetPayloadJson() []byte {
++	if x != nil {
++		return x.PayloadJson
++	}
++	return nil
++}
++
++var File_avitosha_v1_services_proto protoreflect.FileDescriptor
++
++var file_avitosha_v1_services_proto_rawDesc = []byte{
++	0x0a, 0x1a, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2f, 0x76, 0x31, 0x2f, 0x73, 0x65,
++	0x72, 0x76, 0x69, 0x63, 0x65, 0x73, 0x2e, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x12, 0x0b, 0x61, 0x76,
++	0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x22, 0x07, 0x0a, 0x05, 0x45, 0x6d, 0x70,
++	0x74, 0x79, 0x22, 0x62, 0x0a, 0x0f, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x52, 0x65,
++	0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x14, 0x0a, 0x05, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x18, 0x01,
++	0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x12, 0x1a, 0x0a, 0x08, 0x70,
++	0x61, 0x73, 0x73, 0x77, 0x6f, 0x72, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x70,
++	0x61, 0x73, 0x73, 0x77, 0x6f, 0x72, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x75, 0x73, 0x65, 0x72, 0x5f,
++	0x61, 0x67, 0x65, 0x6e, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x75, 0x73, 0x65,
++	0x72, 0x41, 0x67, 0x65, 0x6e, 0x74, 0x22, 0x5f, 0x0a, 0x0c, 0x4c, 0x6f, 0x67, 0x69, 0x6e, 0x52,
++	0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x14, 0x0a, 0x05, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x18,
++	0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x12, 0x1a, 0x0a, 0x08,
++	0x70, 0x61, 0x73, 0x73, 0x77, 0x6f, 0x72, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08,
++	0x70, 0x61, 0x73, 0x73, 0x77, 0x6f, 0x72, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x75, 0x73, 0x65, 0x72,
++	0x5f, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x75, 0x73,
++	0x65, 0x72, 0x41, 0x67, 0x65, 0x6e, 0x74, 0x22, 0x35, 0x0a, 0x0e, 0x52, 0x65, 0x66, 0x72, 0x65,
++	0x73, 0x68, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x23, 0x0a, 0x0d, 0x72, 0x65, 0x66,
++	0x72, 0x65, 0x73, 0x68, 0x5f, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x0c, 0x72, 0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x22, 0x34,
++	0x0a, 0x0d, 0x4c, 0x6f, 0x67, 0x6f, 0x75, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12,
++	0x23, 0x0a, 0x0d, 0x72, 0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x5f, 0x74, 0x6f, 0x6b, 0x65, 0x6e,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c, 0x72, 0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x54,
++	0x6f, 0x6b, 0x65, 0x6e, 0x22, 0x4f, 0x0a, 0x15, 0x47, 0x65, 0x74, 0x43, 0x75, 0x72, 0x72, 0x65,
++	0x6e, 0x74, 0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x17, 0x0a,
++	0x07, 0x75, 0x73, 0x65, 0x72, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06,
++	0x75, 0x73, 0x65, 0x72, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65, 0x73, 0x73, 0x69, 0x6f,
++	0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x65, 0x73, 0x73,
++	0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22, 0x43, 0x0a, 0x1e, 0x41, 0x75, 0x74, 0x68, 0x65, 0x6e, 0x74,
++	0x69, 0x63, 0x61, 0x74, 0x65, 0x41, 0x63, 0x63, 0x65, 0x73, 0x73, 0x54, 0x6f, 0x6b, 0x65, 0x6e,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x21, 0x0a, 0x0c, 0x61, 0x63, 0x63, 0x65, 0x73,
++	0x73, 0x5f, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0b, 0x61,
++	0x63, 0x63, 0x65, 0x73, 0x73, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x22, 0x6a, 0x0a, 0x04, 0x55, 0x73,
++	0x65, 0x72, 0x12, 0x0e, 0x0a, 0x02, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x02,
++	0x69, 0x64, 0x12, 0x14, 0x0a, 0x05, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x18, 0x02, 0x20, 0x01, 0x28,
++	0x09, 0x52, 0x05, 0x65, 0x6d, 0x61, 0x69, 0x6c, 0x12, 0x1d, 0x0a, 0x0a, 0x63, 0x72, 0x65, 0x61,
++	0x74, 0x65, 0x64, 0x5f, 0x61, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x63, 0x72,
++	0x65, 0x61, 0x74, 0x65, 0x64, 0x41, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x75, 0x70, 0x64, 0x61, 0x74,
++	0x65, 0x64, 0x5f, 0x61, 0x74, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x75, 0x70, 0x64,
++	0x61, 0x74, 0x65, 0x64, 0x41, 0x74, 0x22, 0x87, 0x01, 0x0a, 0x16, 0x41, 0x75, 0x74, 0x68, 0x65,
++	0x6e, 0x74, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x12, 0x25, 0x0a, 0x04, 0x75, 0x73, 0x65, 0x72, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32,
++	0x11, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x55, 0x73,
++	0x65, 0x72, 0x52, 0x04, 0x75, 0x73, 0x65, 0x72, 0x12, 0x21, 0x0a, 0x0c, 0x61, 0x63, 0x63, 0x65,
++	0x73, 0x73, 0x5f, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0b,
++	0x61, 0x63, 0x63, 0x65, 0x73, 0x73, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x12, 0x23, 0x0a, 0x0d, 0x72,
++	0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x5f, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x18, 0x03, 0x20, 0x01,
++	0x28, 0x09, 0x52, 0x0c, 0x72, 0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x54, 0x6f, 0x6b, 0x65, 0x6e,
++	0x22, 0x59, 0x0a, 0x0f, 0x52, 0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x52, 0x65, 0x73, 0x70, 0x6f,
++	0x6e, 0x73, 0x65, 0x12, 0x21, 0x0a, 0x0c, 0x61, 0x63, 0x63, 0x65, 0x73, 0x73, 0x5f, 0x74, 0x6f,
++	0x6b, 0x65, 0x6e, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0b, 0x61, 0x63, 0x63, 0x65, 0x73,
++	0x73, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x12, 0x23, 0x0a, 0x0d, 0x72, 0x65, 0x66, 0x72, 0x65, 0x73,
++	0x68, 0x5f, 0x74, 0x6f, 0x6b, 0x65, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c, 0x72,
++	0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x22, 0x35, 0x0a, 0x0c, 0x55,
++	0x73, 0x65, 0x72, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x25, 0x0a, 0x04, 0x75,
++	0x73, 0x65, 0x72, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x11, 0x2e, 0x61, 0x76, 0x69, 0x74,
++	0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x52, 0x04, 0x75, 0x73,
++	0x65, 0x72, 0x22, 0x53, 0x0a, 0x19, 0x41, 0x75, 0x74, 0x68, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x61,
++	0x74, 0x65, 0x64, 0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12,
++	0x17, 0x0a, 0x07, 0x75, 0x73, 0x65, 0x72, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
++	0x52, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x73, 0x65, 0x73, 0x73,
++	0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x73, 0x65,
++	0x73, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22, 0x38, 0x0a, 0x0d, 0x55, 0x73, 0x65, 0x72, 0x41,
++	0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x17, 0x0a, 0x07, 0x75, 0x73, 0x65, 0x72,
++	0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49,
++	0x64, 0x12, 0x0e, 0x0a, 0x02, 0x61, 0x74, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x02, 0x61,
++	0x74, 0x22, 0x4f, 0x0a, 0x10, 0x52, 0x65, 0x6e, 0x61, 0x6d, 0x65, 0x50, 0x65, 0x74, 0x52, 0x65,
++	0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x17, 0x0a, 0x07, 0x75, 0x73, 0x65, 0x72, 0x5f, 0x69, 0x64,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49, 0x64, 0x12, 0x12,
++	0x0a, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x6e, 0x61,
++	0x6d, 0x65, 0x12, 0x0e, 0x0a, 0x02, 0x61, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x02,
++	0x61, 0x74, 0x22, 0x4f, 0x0a, 0x0b, 0x54, 0x61, 0x73, 0x6b, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x12, 0x17, 0x0a, 0x07, 0x75, 0x73, 0x65, 0x72, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01,
++	0x28, 0x09, 0x52, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49, 0x64, 0x12, 0x17, 0x0a, 0x07, 0x74, 0x61,
++	0x73, 0x6b, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x74, 0x61, 0x73,
++	0x6b, 0x49, 0x64, 0x12, 0x0e, 0x0a, 0x02, 0x61, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52,
++	0x02, 0x61, 0x74, 0x22, 0x53, 0x0a, 0x12, 0x4c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x62, 0x6f, 0x61,
++	0x72, 0x64, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x17, 0x0a, 0x07, 0x75, 0x73, 0x65,
++	0x72, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x75, 0x73, 0x65, 0x72,
++	0x49, 0x64, 0x12, 0x14, 0x0a, 0x05, 0x6c, 0x69, 0x6d, 0x69, 0x74, 0x18, 0x02, 0x20, 0x01, 0x28,
++	0x05, 0x52, 0x05, 0x6c, 0x69, 0x6d, 0x69, 0x74, 0x12, 0x0e, 0x0a, 0x02, 0x61, 0x74, 0x18, 0x03,
++	0x20, 0x01, 0x28, 0x09, 0x52, 0x02, 0x61, 0x74, 0x22, 0xa1, 0x02, 0x0a, 0x14, 0x50, 0x72, 0x6f,
++	0x63, 0x65, 0x73, 0x73, 0x41, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x12, 0x17, 0x0a, 0x07, 0x75, 0x73, 0x65, 0x72, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01,
++	0x28, 0x09, 0x52, 0x06, 0x75, 0x73, 0x65, 0x72, 0x49, 0x64, 0x12, 0x19, 0x0a, 0x08, 0x65, 0x76,
++	0x65, 0x6e, 0x74, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x65, 0x76,
++	0x65, 0x6e, 0x74, 0x49, 0x64, 0x12, 0x1f, 0x0a, 0x0b, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x5f,
++	0x74, 0x79, 0x70, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x61, 0x63, 0x74, 0x69,
++	0x6f, 0x6e, 0x54, 0x79, 0x70, 0x65, 0x12, 0x20, 0x0a, 0x09, 0x65, 0x6e, 0x74, 0x69, 0x74, 0x79,
++	0x5f, 0x69, 0x64, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x48, 0x00, 0x52, 0x08, 0x65, 0x6e, 0x74,
++	0x69, 0x74, 0x79, 0x49, 0x64, 0x88, 0x01, 0x01, 0x12, 0x1f, 0x0a, 0x08, 0x63, 0x61, 0x74, 0x65,
++	0x67, 0x6f, 0x72, 0x79, 0x18, 0x05, 0x20, 0x01, 0x28, 0x09, 0x48, 0x01, 0x52, 0x08, 0x63, 0x61,
++	0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x88, 0x01, 0x01, 0x12, 0x23, 0x0a, 0x0d, 0x6d, 0x65, 0x74,
++	0x61, 0x64, 0x61, 0x74, 0x61, 0x5f, 0x6a, 0x73, 0x6f, 0x6e, 0x18, 0x06, 0x20, 0x01, 0x28, 0x0c,
++	0x52, 0x0c, 0x6d, 0x65, 0x74, 0x61, 0x64, 0x61, 0x74, 0x61, 0x4a, 0x73, 0x6f, 0x6e, 0x12, 0x1f,
++	0x0a, 0x0b, 0x6f, 0x63, 0x63, 0x75, 0x72, 0x72, 0x65, 0x64, 0x5f, 0x61, 0x74, 0x18, 0x07, 0x20,
++	0x01, 0x28, 0x09, 0x52, 0x0a, 0x6f, 0x63, 0x63, 0x75, 0x72, 0x72, 0x65, 0x64, 0x41, 0x74, 0x12,
++	0x10, 0x0a, 0x03, 0x6e, 0x6f, 0x77, 0x18, 0x08, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6e, 0x6f,
++	0x77, 0x42, 0x0c, 0x0a, 0x0a, 0x5f, 0x65, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x5f, 0x69, 0x64, 0x42,
++	0x0b, 0x0a, 0x09, 0x5f, 0x63, 0x61, 0x74, 0x65, 0x67, 0x6f, 0x72, 0x79, 0x22, 0x31, 0x0a, 0x0c,
++	0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x21, 0x0a, 0x0c,
++	0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x5f, 0x6a, 0x73, 0x6f, 0x6e, 0x18, 0x01, 0x20, 0x01,
++	0x28, 0x0c, 0x52, 0x0b, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x4a, 0x73, 0x6f, 0x6e, 0x22,
++	0x31, 0x0a, 0x16, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x45, 0x76, 0x65, 0x6e,
++	0x74, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x17, 0x0a, 0x07, 0x75, 0x73, 0x65,
++	0x72, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x75, 0x73, 0x65, 0x72,
++	0x49, 0x64, 0x22, 0x2f, 0x0a, 0x0a, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x42, 0x61, 0x74, 0x63, 0x68,
++	0x12, 0x21, 0x0a, 0x0c, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x5f, 0x6a, 0x73, 0x6f, 0x6e,
++	0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0b, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x4a,
++	0x73, 0x6f, 0x6e, 0x32, 0xe6, 0x03, 0x0a, 0x0b, 0x41, 0x75, 0x74, 0x68, 0x53, 0x65, 0x72, 0x76,
++	0x69, 0x63, 0x65, 0x12, 0x4d, 0x0a, 0x08, 0x52, 0x65, 0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x12,
++	0x1c, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x52, 0x65,
++	0x67, 0x69, 0x73, 0x74, 0x65, 0x72, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x23, 0x2e,
++	0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x41, 0x75, 0x74, 0x68,
++	0x65, 0x6e, 0x74, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x12, 0x47, 0x0a, 0x05, 0x4c, 0x6f, 0x67, 0x69, 0x6e, 0x12, 0x19, 0x2e, 0x61, 0x76,
++	0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4c, 0x6f, 0x67, 0x69, 0x6e, 0x52,
++	0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x23, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68,
++	0x61, 0x2e, 0x76, 0x31, 0x2e, 0x41, 0x75, 0x74, 0x68, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x61, 0x74,
++	0x69, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x44, 0x0a, 0x07, 0x52,
++	0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x12, 0x1b, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68,
++	0x61, 0x2e, 0x76, 0x31, 0x2e, 0x52, 0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x52, 0x65, 0x71, 0x75,
++	0x65, 0x73, 0x74, 0x1a, 0x1c, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76,
++	0x31, 0x2e, 0x52, 0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x12, 0x38, 0x0a, 0x06, 0x4c, 0x6f, 0x67, 0x6f, 0x75, 0x74, 0x12, 0x1a, 0x2e, 0x61, 0x76,
++	0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4c, 0x6f, 0x67, 0x6f, 0x75, 0x74,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x12, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73,
++	0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x45, 0x6d, 0x70, 0x74, 0x79, 0x12, 0x4f, 0x0a, 0x0e, 0x47,
++	0x65, 0x74, 0x43, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x55, 0x73, 0x65, 0x72, 0x12, 0x22, 0x2e,
++	0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x47, 0x65, 0x74, 0x43,
++	0x75, 0x72, 0x72, 0x65, 0x6e, 0x74, 0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e,
++	0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x6e, 0x0a, 0x17,
++	0x41, 0x75, 0x74, 0x68, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x61, 0x74, 0x65, 0x41, 0x63, 0x63, 0x65,
++	0x73, 0x73, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x12, 0x2b, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73,
++	0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x41, 0x75, 0x74, 0x68, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x61,
++	0x74, 0x65, 0x41, 0x63, 0x63, 0x65, 0x73, 0x73, 0x54, 0x6f, 0x6b, 0x65, 0x6e, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x1a, 0x26, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e,
++	0x76, 0x31, 0x2e, 0x41, 0x75, 0x74, 0x68, 0x65, 0x6e, 0x74, 0x69, 0x63, 0x61, 0x74, 0x65, 0x64,
++	0x55, 0x73, 0x65, 0x72, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x32, 0x85, 0x08, 0x0a,
++	0x0b, 0x47, 0x61, 0x6d, 0x65, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x46, 0x0a, 0x0d,
++	0x45, 0x6e, 0x73, 0x75, 0x72, 0x65, 0x50, 0x72, 0x6f, 0x66, 0x69, 0x6c, 0x65, 0x12, 0x1a, 0x2e,
++	0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x55, 0x73, 0x65, 0x72,
++	0x41, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74,
++	0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70,
++	0x6f, 0x6e, 0x73, 0x65, 0x12, 0x45, 0x0a, 0x09, 0x52, 0x65, 0x6e, 0x61, 0x6d, 0x65, 0x50, 0x65,
++	0x74, 0x12, 0x1d, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e,
++	0x52, 0x65, 0x6e, 0x61, 0x6d, 0x65, 0x50, 0x65, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
++	0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a,
++	0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x42, 0x0a, 0x09, 0x4c,
++	0x69, 0x73, 0x74, 0x54, 0x61, 0x73, 0x6b, 0x73, 0x12, 0x1a, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f,
++	0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x41, 0x74, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e,
++	0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12,
++	0x3e, 0x0a, 0x07, 0x47, 0x65, 0x74, 0x54, 0x61, 0x73, 0x6b, 0x12, 0x18, 0x2e, 0x61, 0x76, 0x69,
++	0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x54, 0x61, 0x73, 0x6b, 0x52, 0x65, 0x71,
++	0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e,
++	0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12,
++	0x44, 0x0a, 0x0d, 0x47, 0x65, 0x74, 0x54, 0x61, 0x73, 0x6b, 0x41, 0x64, 0x76, 0x69, 0x63, 0x65,
++	0x12, 0x18, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x54,
++	0x61, 0x73, 0x6b, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69,
++	0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73,
++	0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x40, 0x0a, 0x07, 0x47, 0x65, 0x74, 0x52, 0x6f, 0x6f, 0x6d,
++	0x12, 0x1a, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x55,
++	0x73, 0x65, 0x72, 0x41, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61,
++	0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52,
++	0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x41, 0x0a, 0x08, 0x47, 0x65, 0x74, 0x53, 0x74,
++	0x6f, 0x72, 0x79, 0x12, 0x1a, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76,
++	0x31, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x41, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a,
++	0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73,
++	0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x48, 0x0a, 0x0f, 0x47, 0x65,
++	0x74, 0x44, 0x61, 0x69, 0x6c, 0x79, 0x53, 0x75, 0x6d, 0x6d, 0x61, 0x72, 0x79, 0x12, 0x1a, 0x2e,
++	0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x55, 0x73, 0x65, 0x72,
++	0x41, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74,
++	0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70,
++	0x6f, 0x6e, 0x73, 0x65, 0x12, 0x4c, 0x0a, 0x0e, 0x47, 0x65, 0x74, 0x4c, 0x65, 0x61, 0x64, 0x65,
++	0x72, 0x62, 0x6f, 0x61, 0x72, 0x64, 0x12, 0x1f, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68,
++	0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x62, 0x6f, 0x61, 0x72, 0x64,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73,
++	0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x12, 0x48, 0x0a, 0x0f, 0x47, 0x65, 0x74, 0x41, 0x63, 0x68, 0x69, 0x65, 0x76, 0x65,
++	0x6d, 0x65, 0x6e, 0x74, 0x73, 0x12, 0x1a, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61,
++	0x2e, 0x76, 0x31, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x41, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
++	0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e,
++	0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x4a, 0x0a, 0x11,
++	0x47, 0x65, 0x74, 0x52, 0x65, 0x77, 0x61, 0x72, 0x64, 0x42, 0x61, 0x6c, 0x61, 0x6e, 0x63, 0x65,
++	0x73, 0x12, 0x1a, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e,
++	0x55, 0x73, 0x65, 0x72, 0x41, 0x74, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e,
++	0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e,
++	0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x48, 0x0a, 0x0f, 0x47, 0x65, 0x74, 0x52,
++	0x65, 0x77, 0x61, 0x72, 0x64, 0x57, 0x61, 0x6c, 0x6c, 0x65, 0x74, 0x12, 0x1a, 0x2e, 0x61, 0x76,
++	0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x55, 0x73, 0x65, 0x72, 0x41, 0x74,
++	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73,
++	0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
++	0x73, 0x65, 0x12, 0x4d, 0x0a, 0x0d, 0x50, 0x72, 0x6f, 0x63, 0x65, 0x73, 0x73, 0x41, 0x63, 0x74,
++	0x69, 0x6f, 0x6e, 0x12, 0x21, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76,
++	0x31, 0x2e, 0x50, 0x72, 0x6f, 0x63, 0x65, 0x73, 0x73, 0x41, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x52,
++	0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x19, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68,
++	0x61, 0x2e, 0x76, 0x31, 0x2e, 0x4a, 0x73, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
++	0x65, 0x12, 0x51, 0x0a, 0x0f, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x45, 0x76,
++	0x65, 0x6e, 0x74, 0x73, 0x12, 0x23, 0x2e, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2e,
++	0x76, 0x31, 0x2e, 0x53, 0x75, 0x62, 0x73, 0x63, 0x72, 0x69, 0x62, 0x65, 0x45, 0x76, 0x65, 0x6e,
++	0x74, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x17, 0x2e, 0x61, 0x76, 0x69, 0x74,
++	0x6f, 0x73, 0x68, 0x61, 0x2e, 0x76, 0x31, 0x2e, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x42, 0x61, 0x74,
++	0x63, 0x68, 0x30, 0x01, 0x42, 0x56, 0x5a, 0x54, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63,
++	0x6f, 0x6d, 0x2f, 0x67, 0x75, 0x69, 0x74, 0x61, 0x72, 0x61, 0x6d, 0x75, 0x73, 0x74, 0x2d, 0x73,
++	0x75, 0x64, 0x6f, 0x2f, 0x41, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2f, 0x61, 0x70, 0x70,
++	0x2f, 0x62, 0x61, 0x63, 0x6b, 0x65, 0x6e, 0x64, 0x2f, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x61,
++	0x6c, 0x2f, 0x67, 0x65, 0x6e, 0x2f, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x2f, 0x76,
++	0x31, 0x3b, 0x61, 0x76, 0x69, 0x74, 0x6f, 0x73, 0x68, 0x61, 0x76, 0x31, 0x62, 0x06, 0x70, 0x72,
++	0x6f, 0x74, 0x6f, 0x33,
++}
++
++var (
++	file_avitosha_v1_services_proto_rawDescOnce sync.Once
++	file_avitosha_v1_services_proto_rawDescData = file_avitosha_v1_services_proto_rawDesc
++)
++
++func file_avitosha_v1_services_proto_rawDescGZIP() []byte {
++	file_avitosha_v1_services_proto_rawDescOnce.Do(func() {
++		file_avitosha_v1_services_proto_rawDescData = protoimpl.X.CompressGZIP(file_avitosha_v1_services_proto_rawDescData)
++	})
++	return file_avitosha_v1_services_proto_rawDescData
++}
++
++var file_avitosha_v1_services_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
++var file_avitosha_v1_services_proto_goTypes = []interface{}{
++	(*Empty)(nil),                          // 0: avitosha.v1.Empty
++	(*RegisterRequest)(nil),                // 1: avitosha.v1.RegisterRequest
++	(*LoginRequest)(nil),                   // 2: avitosha.v1.LoginRequest
++	(*RefreshRequest)(nil),                 // 3: avitosha.v1.RefreshRequest
++	(*LogoutRequest)(nil),                  // 4: avitosha.v1.LogoutRequest
++	(*GetCurrentUserRequest)(nil),          // 5: avitosha.v1.GetCurrentUserRequest
++	(*AuthenticateAccessTokenRequest)(nil), // 6: avitosha.v1.AuthenticateAccessTokenRequest
++	(*User)(nil),                           // 7: avitosha.v1.User
++	(*AuthenticationResponse)(nil),         // 8: avitosha.v1.AuthenticationResponse
++	(*RefreshResponse)(nil),                // 9: avitosha.v1.RefreshResponse
++	(*UserResponse)(nil),                   // 10: avitosha.v1.UserResponse
++	(*AuthenticatedUserResponse)(nil),      // 11: avitosha.v1.AuthenticatedUserResponse
++	(*UserAtRequest)(nil),                  // 12: avitosha.v1.UserAtRequest
++	(*RenamePetRequest)(nil),               // 13: avitosha.v1.RenamePetRequest
++	(*TaskRequest)(nil),                    // 14: avitosha.v1.TaskRequest
++	(*LeaderboardRequest)(nil),             // 15: avitosha.v1.LeaderboardRequest
++	(*ProcessActionRequest)(nil),           // 16: avitosha.v1.ProcessActionRequest
++	(*JsonResponse)(nil),                   // 17: avitosha.v1.JsonResponse
++	(*SubscribeEventsRequest)(nil),         // 18: avitosha.v1.SubscribeEventsRequest
++	(*EventBatch)(nil),                     // 19: avitosha.v1.EventBatch
++}
++var file_avitosha_v1_services_proto_depIdxs = []int32{
++	7,  // 0: avitosha.v1.AuthenticationResponse.user:type_name -> avitosha.v1.User
++	7,  // 1: avitosha.v1.UserResponse.user:type_name -> avitosha.v1.User
++	1,  // 2: avitosha.v1.AuthService.Register:input_type -> avitosha.v1.RegisterRequest
++	2,  // 3: avitosha.v1.AuthService.Login:input_type -> avitosha.v1.LoginRequest
++	3,  // 4: avitosha.v1.AuthService.Refresh:input_type -> avitosha.v1.RefreshRequest
++	4,  // 5: avitosha.v1.AuthService.Logout:input_type -> avitosha.v1.LogoutRequest
++	5,  // 6: avitosha.v1.AuthService.GetCurrentUser:input_type -> avitosha.v1.GetCurrentUserRequest
++	6,  // 7: avitosha.v1.AuthService.AuthenticateAccessToken:input_type -> avitosha.v1.AuthenticateAccessTokenRequest
++	12, // 8: avitosha.v1.GameService.EnsureProfile:input_type -> avitosha.v1.UserAtRequest
++	13, // 9: avitosha.v1.GameService.RenamePet:input_type -> avitosha.v1.RenamePetRequest
++	12, // 10: avitosha.v1.GameService.ListTasks:input_type -> avitosha.v1.UserAtRequest
++	14, // 11: avitosha.v1.GameService.GetTask:input_type -> avitosha.v1.TaskRequest
++	14, // 12: avitosha.v1.GameService.GetTaskAdvice:input_type -> avitosha.v1.TaskRequest
++	12, // 13: avitosha.v1.GameService.GetRoom:input_type -> avitosha.v1.UserAtRequest
++	12, // 14: avitosha.v1.GameService.GetStory:input_type -> avitosha.v1.UserAtRequest
++	12, // 15: avitosha.v1.GameService.GetDailySummary:input_type -> avitosha.v1.UserAtRequest
++	15, // 16: avitosha.v1.GameService.GetLeaderboard:input_type -> avitosha.v1.LeaderboardRequest
++	12, // 17: avitosha.v1.GameService.GetAchievements:input_type -> avitosha.v1.UserAtRequest
++	12, // 18: avitosha.v1.GameService.GetRewardBalances:input_type -> avitosha.v1.UserAtRequest
++	12, // 19: avitosha.v1.GameService.GetRewardWallet:input_type -> avitosha.v1.UserAtRequest
++	16, // 20: avitosha.v1.GameService.ProcessAction:input_type -> avitosha.v1.ProcessActionRequest
++	18, // 21: avitosha.v1.GameService.SubscribeEvents:input_type -> avitosha.v1.SubscribeEventsRequest
++	8,  // 22: avitosha.v1.AuthService.Register:output_type -> avitosha.v1.AuthenticationResponse
++	8,  // 23: avitosha.v1.AuthService.Login:output_type -> avitosha.v1.AuthenticationResponse
++	9,  // 24: avitosha.v1.AuthService.Refresh:output_type -> avitosha.v1.RefreshResponse
++	0,  // 25: avitosha.v1.AuthService.Logout:output_type -> avitosha.v1.Empty
++	10, // 26: avitosha.v1.AuthService.GetCurrentUser:output_type -> avitosha.v1.UserResponse
++	11, // 27: avitosha.v1.AuthService.AuthenticateAccessToken:output_type -> avitosha.v1.AuthenticatedUserResponse
++	17, // 28: avitosha.v1.GameService.EnsureProfile:output_type -> avitosha.v1.JsonResponse
++	17, // 29: avitosha.v1.GameService.RenamePet:output_type -> avitosha.v1.JsonResponse
++	17, // 30: avitosha.v1.GameService.ListTasks:output_type -> avitosha.v1.JsonResponse
++	17, // 31: avitosha.v1.GameService.GetTask:output_type -> avitosha.v1.JsonResponse
++	17, // 32: avitosha.v1.GameService.GetTaskAdvice:output_type -> avitosha.v1.JsonResponse
++	17, // 33: avitosha.v1.GameService.GetRoom:output_type -> avitosha.v1.JsonResponse
++	17, // 34: avitosha.v1.GameService.GetStory:output_type -> avitosha.v1.JsonResponse
++	17, // 35: avitosha.v1.GameService.GetDailySummary:output_type -> avitosha.v1.JsonResponse
++	17, // 36: avitosha.v1.GameService.GetLeaderboard:output_type -> avitosha.v1.JsonResponse
++	17, // 37: avitosha.v1.GameService.GetAchievements:output_type -> avitosha.v1.JsonResponse
++	17, // 38: avitosha.v1.GameService.GetRewardBalances:output_type -> avitosha.v1.JsonResponse
++	17, // 39: avitosha.v1.GameService.GetRewardWallet:output_type -> avitosha.v1.JsonResponse
++	17, // 40: avitosha.v1.GameService.ProcessAction:output_type -> avitosha.v1.JsonResponse
++	19, // 41: avitosha.v1.GameService.SubscribeEvents:output_type -> avitosha.v1.EventBatch
++	22, // [22:42] is the sub-list for method output_type
++	2,  // [2:22] is the sub-list for method input_type
++	2,  // [2:2] is the sub-list for extension type_name
++	2,  // [2:2] is the sub-list for extension extendee
++	0,  // [0:2] is the sub-list for field type_name
++}
++
++func init() { file_avitosha_v1_services_proto_init() }
++func file_avitosha_v1_services_proto_init() {
++	if File_avitosha_v1_services_proto != nil {
++		return
++	}
++	if !protoimpl.UnsafeEnabled {
++		file_avitosha_v1_services_proto_msgTypes[0].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*Empty); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[1].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RegisterRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*LoginRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RefreshRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*LogoutRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*GetCurrentUserRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AuthenticateAccessTokenRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[7].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*User); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[8].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AuthenticationResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[9].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RefreshResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[10].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*UserResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[11].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*AuthenticatedUserResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[12].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*UserAtRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[13].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*RenamePetRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[14].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*TaskRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[15].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*LeaderboardRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[16].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*ProcessActionRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[17].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*JsonResponse); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[18].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*SubscribeEventsRequest); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++		file_avitosha_v1_services_proto_msgTypes[19].Exporter = func(v interface{}, i int) interface{} {
++			switch v := v.(*EventBatch); i {
++			case 0:
++				return &v.state
++			case 1:
++				return &v.sizeCache
++			case 2:
++				return &v.unknownFields
++			default:
++				return nil
++			}
++		}
++	}
++	file_avitosha_v1_services_proto_msgTypes[16].OneofWrappers = []interface{}{}
++	type x struct{}
++	out := protoimpl.TypeBuilder{
++		File: protoimpl.DescBuilder{
++			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
++			RawDescriptor: file_avitosha_v1_services_proto_rawDesc,
++			NumEnums:      0,
++			NumMessages:   20,
++			NumExtensions: 0,
++			NumServices:   2,
++		},
++		GoTypes:           file_avitosha_v1_services_proto_goTypes,
++		DependencyIndexes: file_avitosha_v1_services_proto_depIdxs,
++		MessageInfos:      file_avitosha_v1_services_proto_msgTypes,
++	}.Build()
++	File_avitosha_v1_services_proto = out.File
++	file_avitosha_v1_services_proto_rawDesc = nil
++	file_avitosha_v1_services_proto_goTypes = nil
++	file_avitosha_v1_services_proto_depIdxs = nil
++}
+diff --git a/app/backend/internal/gen/avitosha/v1/services_grpc.pb.go b/app/backend/internal/gen/avitosha/v1/services_grpc.pb.go
+new file mode 100644
+index 0000000..d1a7386
+--- /dev/null
++++ b/app/backend/internal/gen/avitosha/v1/services_grpc.pb.go
+@@ -0,0 +1,913 @@
++// Code generated by protoc-gen-go-grpc. DO NOT EDIT.
++// versions:
++// - protoc-gen-go-grpc v1.4.0
++// - protoc             (unknown)
++// source: avitosha/v1/services.proto
++
++package avitoshav1
++
++import (
++	context "context"
++	grpc "google.golang.org/grpc"
++	codes "google.golang.org/grpc/codes"
++	status "google.golang.org/grpc/status"
++)
++
++// This is a compile-time assertion to ensure that this generated file
++// is compatible with the grpc package it is being compiled against.
++// Requires gRPC-Go v1.62.0 or later.
++const _ = grpc.SupportPackageIsVersion8
++
++const (
++	AuthService_Register_FullMethodName                = "/avitosha.v1.AuthService/Register"
++	AuthService_Login_FullMethodName                   = "/avitosha.v1.AuthService/Login"
++	AuthService_Refresh_FullMethodName                 = "/avitosha.v1.AuthService/Refresh"
++	AuthService_Logout_FullMethodName                  = "/avitosha.v1.AuthService/Logout"
++	AuthService_GetCurrentUser_FullMethodName          = "/avitosha.v1.AuthService/GetCurrentUser"
++	AuthService_AuthenticateAccessToken_FullMethodName = "/avitosha.v1.AuthService/AuthenticateAccessToken"
++)
++
++// AuthServiceClient is the client API for AuthService service.
++//
++// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
++type AuthServiceClient interface {
++	Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*AuthenticationResponse, error)
++	Login(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*AuthenticationResponse, error)
++	Refresh(ctx context.Context, in *RefreshRequest, opts ...grpc.CallOption) (*RefreshResponse, error)
++	Logout(ctx context.Context, in *LogoutRequest, opts ...grpc.CallOption) (*Empty, error)
++	GetCurrentUser(ctx context.Context, in *GetCurrentUserRequest, opts ...grpc.CallOption) (*UserResponse, error)
++	AuthenticateAccessToken(ctx context.Context, in *AuthenticateAccessTokenRequest, opts ...grpc.CallOption) (*AuthenticatedUserResponse, error)
++}
++
++type authServiceClient struct {
++	cc grpc.ClientConnInterface
++}
++
++func NewAuthServiceClient(cc grpc.ClientConnInterface) AuthServiceClient {
++	return &authServiceClient{cc}
++}
++
++func (c *authServiceClient) Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*AuthenticationResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(AuthenticationResponse)
++	err := c.cc.Invoke(ctx, AuthService_Register_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *authServiceClient) Login(ctx context.Context, in *LoginRequest, opts ...grpc.CallOption) (*AuthenticationResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(AuthenticationResponse)
++	err := c.cc.Invoke(ctx, AuthService_Login_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *authServiceClient) Refresh(ctx context.Context, in *RefreshRequest, opts ...grpc.CallOption) (*RefreshResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(RefreshResponse)
++	err := c.cc.Invoke(ctx, AuthService_Refresh_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *authServiceClient) Logout(ctx context.Context, in *LogoutRequest, opts ...grpc.CallOption) (*Empty, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(Empty)
++	err := c.cc.Invoke(ctx, AuthService_Logout_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *authServiceClient) GetCurrentUser(ctx context.Context, in *GetCurrentUserRequest, opts ...grpc.CallOption) (*UserResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(UserResponse)
++	err := c.cc.Invoke(ctx, AuthService_GetCurrentUser_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *authServiceClient) AuthenticateAccessToken(ctx context.Context, in *AuthenticateAccessTokenRequest, opts ...grpc.CallOption) (*AuthenticatedUserResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(AuthenticatedUserResponse)
++	err := c.cc.Invoke(ctx, AuthService_AuthenticateAccessToken_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++// AuthServiceServer is the server API for AuthService service.
++// All implementations must embed UnimplementedAuthServiceServer
++// for forward compatibility
++type AuthServiceServer interface {
++	Register(context.Context, *RegisterRequest) (*AuthenticationResponse, error)
++	Login(context.Context, *LoginRequest) (*AuthenticationResponse, error)
++	Refresh(context.Context, *RefreshRequest) (*RefreshResponse, error)
++	Logout(context.Context, *LogoutRequest) (*Empty, error)
++	GetCurrentUser(context.Context, *GetCurrentUserRequest) (*UserResponse, error)
++	AuthenticateAccessToken(context.Context, *AuthenticateAccessTokenRequest) (*AuthenticatedUserResponse, error)
++	mustEmbedUnimplementedAuthServiceServer()
++}
++
++// UnimplementedAuthServiceServer must be embedded to have forward compatible implementations.
++type UnimplementedAuthServiceServer struct {
++}
++
++func (UnimplementedAuthServiceServer) Register(context.Context, *RegisterRequest) (*AuthenticationResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Register not implemented")
++}
++func (UnimplementedAuthServiceServer) Login(context.Context, *LoginRequest) (*AuthenticationResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Login not implemented")
++}
++func (UnimplementedAuthServiceServer) Refresh(context.Context, *RefreshRequest) (*RefreshResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Refresh not implemented")
++}
++func (UnimplementedAuthServiceServer) Logout(context.Context, *LogoutRequest) (*Empty, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method Logout not implemented")
++}
++func (UnimplementedAuthServiceServer) GetCurrentUser(context.Context, *GetCurrentUserRequest) (*UserResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetCurrentUser not implemented")
++}
++func (UnimplementedAuthServiceServer) AuthenticateAccessToken(context.Context, *AuthenticateAccessTokenRequest) (*AuthenticatedUserResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method AuthenticateAccessToken not implemented")
++}
++func (UnimplementedAuthServiceServer) mustEmbedUnimplementedAuthServiceServer() {}
++
++// UnsafeAuthServiceServer may be embedded to opt out of forward compatibility for this service.
++// Use of this interface is not recommended, as added methods to AuthServiceServer will
++// result in compilation errors.
++type UnsafeAuthServiceServer interface {
++	mustEmbedUnimplementedAuthServiceServer()
++}
++
++func RegisterAuthServiceServer(s grpc.ServiceRegistrar, srv AuthServiceServer) {
++	s.RegisterService(&AuthService_ServiceDesc, srv)
++}
++
++func _AuthService_Register_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RegisterRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(AuthServiceServer).Register(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: AuthService_Register_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(AuthServiceServer).Register(ctx, req.(*RegisterRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _AuthService_Login_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(LoginRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(AuthServiceServer).Login(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: AuthService_Login_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(AuthServiceServer).Login(ctx, req.(*LoginRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _AuthService_Refresh_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RefreshRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(AuthServiceServer).Refresh(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: AuthService_Refresh_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(AuthServiceServer).Refresh(ctx, req.(*RefreshRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _AuthService_Logout_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(LogoutRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(AuthServiceServer).Logout(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: AuthService_Logout_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(AuthServiceServer).Logout(ctx, req.(*LogoutRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _AuthService_GetCurrentUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(GetCurrentUserRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(AuthServiceServer).GetCurrentUser(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: AuthService_GetCurrentUser_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(AuthServiceServer).GetCurrentUser(ctx, req.(*GetCurrentUserRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _AuthService_AuthenticateAccessToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(AuthenticateAccessTokenRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(AuthServiceServer).AuthenticateAccessToken(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: AuthService_AuthenticateAccessToken_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(AuthServiceServer).AuthenticateAccessToken(ctx, req.(*AuthenticateAccessTokenRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++// AuthService_ServiceDesc is the grpc.ServiceDesc for AuthService service.
++// It's only intended for direct use with grpc.RegisterService,
++// and not to be introspected or modified (even as a copy)
++var AuthService_ServiceDesc = grpc.ServiceDesc{
++	ServiceName: "avitosha.v1.AuthService",
++	HandlerType: (*AuthServiceServer)(nil),
++	Methods: []grpc.MethodDesc{
++		{
++			MethodName: "Register",
++			Handler:    _AuthService_Register_Handler,
++		},
++		{
++			MethodName: "Login",
++			Handler:    _AuthService_Login_Handler,
++		},
++		{
++			MethodName: "Refresh",
++			Handler:    _AuthService_Refresh_Handler,
++		},
++		{
++			MethodName: "Logout",
++			Handler:    _AuthService_Logout_Handler,
++		},
++		{
++			MethodName: "GetCurrentUser",
++			Handler:    _AuthService_GetCurrentUser_Handler,
++		},
++		{
++			MethodName: "AuthenticateAccessToken",
++			Handler:    _AuthService_AuthenticateAccessToken_Handler,
++		},
++	},
++	Streams:  []grpc.StreamDesc{},
++	Metadata: "avitosha/v1/services.proto",
++}
++
++const (
++	GameService_EnsureProfile_FullMethodName     = "/avitosha.v1.GameService/EnsureProfile"
++	GameService_RenamePet_FullMethodName         = "/avitosha.v1.GameService/RenamePet"
++	GameService_ListTasks_FullMethodName         = "/avitosha.v1.GameService/ListTasks"
++	GameService_GetTask_FullMethodName           = "/avitosha.v1.GameService/GetTask"
++	GameService_GetTaskAdvice_FullMethodName     = "/avitosha.v1.GameService/GetTaskAdvice"
++	GameService_GetRoom_FullMethodName           = "/avitosha.v1.GameService/GetRoom"
++	GameService_GetStory_FullMethodName          = "/avitosha.v1.GameService/GetStory"
++	GameService_GetDailySummary_FullMethodName   = "/avitosha.v1.GameService/GetDailySummary"
++	GameService_GetLeaderboard_FullMethodName    = "/avitosha.v1.GameService/GetLeaderboard"
++	GameService_GetAchievements_FullMethodName   = "/avitosha.v1.GameService/GetAchievements"
++	GameService_GetRewardBalances_FullMethodName = "/avitosha.v1.GameService/GetRewardBalances"
++	GameService_GetRewardWallet_FullMethodName   = "/avitosha.v1.GameService/GetRewardWallet"
++	GameService_ProcessAction_FullMethodName     = "/avitosha.v1.GameService/ProcessAction"
++	GameService_SubscribeEvents_FullMethodName   = "/avitosha.v1.GameService/SubscribeEvents"
++)
++
++// GameServiceClient is the client API for GameService service.
++//
++// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
++type GameServiceClient interface {
++	EnsureProfile(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	RenamePet(ctx context.Context, in *RenamePetRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	ListTasks(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetTask(ctx context.Context, in *TaskRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetTaskAdvice(ctx context.Context, in *TaskRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetRoom(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetStory(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetDailySummary(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetLeaderboard(ctx context.Context, in *LeaderboardRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetAchievements(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetRewardBalances(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	GetRewardWallet(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	ProcessAction(ctx context.Context, in *ProcessActionRequest, opts ...grpc.CallOption) (*JsonResponse, error)
++	SubscribeEvents(ctx context.Context, in *SubscribeEventsRequest, opts ...grpc.CallOption) (GameService_SubscribeEventsClient, error)
++}
++
++type gameServiceClient struct {
++	cc grpc.ClientConnInterface
++}
++
++func NewGameServiceClient(cc grpc.ClientConnInterface) GameServiceClient {
++	return &gameServiceClient{cc}
++}
++
++func (c *gameServiceClient) EnsureProfile(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_EnsureProfile_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) RenamePet(ctx context.Context, in *RenamePetRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_RenamePet_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) ListTasks(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_ListTasks_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetTask(ctx context.Context, in *TaskRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetTask_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetTaskAdvice(ctx context.Context, in *TaskRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetTaskAdvice_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetRoom(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetRoom_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetStory(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetStory_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetDailySummary(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetDailySummary_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetLeaderboard(ctx context.Context, in *LeaderboardRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetLeaderboard_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetAchievements(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetAchievements_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetRewardBalances(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetRewardBalances_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) GetRewardWallet(ctx context.Context, in *UserAtRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_GetRewardWallet_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) ProcessAction(ctx context.Context, in *ProcessActionRequest, opts ...grpc.CallOption) (*JsonResponse, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	out := new(JsonResponse)
++	err := c.cc.Invoke(ctx, GameService_ProcessAction_FullMethodName, in, out, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
++func (c *gameServiceClient) SubscribeEvents(ctx context.Context, in *SubscribeEventsRequest, opts ...grpc.CallOption) (GameService_SubscribeEventsClient, error) {
++	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
++	stream, err := c.cc.NewStream(ctx, &GameService_ServiceDesc.Streams[0], GameService_SubscribeEvents_FullMethodName, cOpts...)
++	if err != nil {
++		return nil, err
++	}
++	x := &gameServiceSubscribeEventsClient{ClientStream: stream}
++	if err := x.ClientStream.SendMsg(in); err != nil {
++		return nil, err
++	}
++	if err := x.ClientStream.CloseSend(); err != nil {
++		return nil, err
++	}
++	return x, nil
++}
++
++type GameService_SubscribeEventsClient interface {
++	Recv() (*EventBatch, error)
++	grpc.ClientStream
++}
++
++type gameServiceSubscribeEventsClient struct {
++	grpc.ClientStream
++}
++
++func (x *gameServiceSubscribeEventsClient) Recv() (*EventBatch, error) {
++	m := new(EventBatch)
++	if err := x.ClientStream.RecvMsg(m); err != nil {
++		return nil, err
++	}
++	return m, nil
++}
++
++// GameServiceServer is the server API for GameService service.
++// All implementations must embed UnimplementedGameServiceServer
++// for forward compatibility
++type GameServiceServer interface {
++	EnsureProfile(context.Context, *UserAtRequest) (*JsonResponse, error)
++	RenamePet(context.Context, *RenamePetRequest) (*JsonResponse, error)
++	ListTasks(context.Context, *UserAtRequest) (*JsonResponse, error)
++	GetTask(context.Context, *TaskRequest) (*JsonResponse, error)
++	GetTaskAdvice(context.Context, *TaskRequest) (*JsonResponse, error)
++	GetRoom(context.Context, *UserAtRequest) (*JsonResponse, error)
++	GetStory(context.Context, *UserAtRequest) (*JsonResponse, error)
++	GetDailySummary(context.Context, *UserAtRequest) (*JsonResponse, error)
++	GetLeaderboard(context.Context, *LeaderboardRequest) (*JsonResponse, error)
++	GetAchievements(context.Context, *UserAtRequest) (*JsonResponse, error)
++	GetRewardBalances(context.Context, *UserAtRequest) (*JsonResponse, error)
++	GetRewardWallet(context.Context, *UserAtRequest) (*JsonResponse, error)
++	ProcessAction(context.Context, *ProcessActionRequest) (*JsonResponse, error)
++	SubscribeEvents(*SubscribeEventsRequest, GameService_SubscribeEventsServer) error
++	mustEmbedUnimplementedGameServiceServer()
++}
++
++// UnimplementedGameServiceServer must be embedded to have forward compatible implementations.
++type UnimplementedGameServiceServer struct {
++}
++
++func (UnimplementedGameServiceServer) EnsureProfile(context.Context, *UserAtRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method EnsureProfile not implemented")
++}
++func (UnimplementedGameServiceServer) RenamePet(context.Context, *RenamePetRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method RenamePet not implemented")
++}
++func (UnimplementedGameServiceServer) ListTasks(context.Context, *UserAtRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method ListTasks not implemented")
++}
++func (UnimplementedGameServiceServer) GetTask(context.Context, *TaskRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetTask not implemented")
++}
++func (UnimplementedGameServiceServer) GetTaskAdvice(context.Context, *TaskRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetTaskAdvice not implemented")
++}
++func (UnimplementedGameServiceServer) GetRoom(context.Context, *UserAtRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetRoom not implemented")
++}
++func (UnimplementedGameServiceServer) GetStory(context.Context, *UserAtRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetStory not implemented")
++}
++func (UnimplementedGameServiceServer) GetDailySummary(context.Context, *UserAtRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetDailySummary not implemented")
++}
++func (UnimplementedGameServiceServer) GetLeaderboard(context.Context, *LeaderboardRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetLeaderboard not implemented")
++}
++func (UnimplementedGameServiceServer) GetAchievements(context.Context, *UserAtRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetAchievements not implemented")
++}
++func (UnimplementedGameServiceServer) GetRewardBalances(context.Context, *UserAtRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetRewardBalances not implemented")
++}
++func (UnimplementedGameServiceServer) GetRewardWallet(context.Context, *UserAtRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method GetRewardWallet not implemented")
++}
++func (UnimplementedGameServiceServer) ProcessAction(context.Context, *ProcessActionRequest) (*JsonResponse, error) {
++	return nil, status.Errorf(codes.Unimplemented, "method ProcessAction not implemented")
++}
++func (UnimplementedGameServiceServer) SubscribeEvents(*SubscribeEventsRequest, GameService_SubscribeEventsServer) error {
++	return status.Errorf(codes.Unimplemented, "method SubscribeEvents not implemented")
++}
++func (UnimplementedGameServiceServer) mustEmbedUnimplementedGameServiceServer() {}
++
++// UnsafeGameServiceServer may be embedded to opt out of forward compatibility for this service.
++// Use of this interface is not recommended, as added methods to GameServiceServer will
++// result in compilation errors.
++type UnsafeGameServiceServer interface {
++	mustEmbedUnimplementedGameServiceServer()
++}
++
++func RegisterGameServiceServer(s grpc.ServiceRegistrar, srv GameServiceServer) {
++	s.RegisterService(&GameService_ServiceDesc, srv)
++}
++
++func _GameService_EnsureProfile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UserAtRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).EnsureProfile(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_EnsureProfile_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).EnsureProfile(ctx, req.(*UserAtRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_RenamePet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(RenamePetRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).RenamePet(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_RenamePet_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).RenamePet(ctx, req.(*RenamePetRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_ListTasks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UserAtRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).ListTasks(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_ListTasks_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).ListTasks(ctx, req.(*UserAtRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(TaskRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetTask(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetTask_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetTask(ctx, req.(*TaskRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetTaskAdvice_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(TaskRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetTaskAdvice(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetTaskAdvice_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetTaskAdvice(ctx, req.(*TaskRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetRoom_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UserAtRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetRoom(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetRoom_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetRoom(ctx, req.(*UserAtRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetStory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UserAtRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetStory(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetStory_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetStory(ctx, req.(*UserAtRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetDailySummary_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UserAtRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetDailySummary(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetDailySummary_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetDailySummary(ctx, req.(*UserAtRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetLeaderboard_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(LeaderboardRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetLeaderboard(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetLeaderboard_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetLeaderboard(ctx, req.(*LeaderboardRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetAchievements_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UserAtRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetAchievements(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetAchievements_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetAchievements(ctx, req.(*UserAtRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetRewardBalances_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UserAtRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetRewardBalances(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetRewardBalances_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetRewardBalances(ctx, req.(*UserAtRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_GetRewardWallet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(UserAtRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).GetRewardWallet(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_GetRewardWallet_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).GetRewardWallet(ctx, req.(*UserAtRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_ProcessAction_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++	in := new(ProcessActionRequest)
++	if err := dec(in); err != nil {
++		return nil, err
++	}
++	if interceptor == nil {
++		return srv.(GameServiceServer).ProcessAction(ctx, in)
++	}
++	info := &grpc.UnaryServerInfo{
++		Server:     srv,
++		FullMethod: GameService_ProcessAction_FullMethodName,
++	}
++	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
++		return srv.(GameServiceServer).ProcessAction(ctx, req.(*ProcessActionRequest))
++	}
++	return interceptor(ctx, in, info, handler)
++}
++
++func _GameService_SubscribeEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
++	m := new(SubscribeEventsRequest)
++	if err := stream.RecvMsg(m); err != nil {
++		return err
++	}
++	return srv.(GameServiceServer).SubscribeEvents(m, &gameServiceSubscribeEventsServer{ServerStream: stream})
++}
++
++type GameService_SubscribeEventsServer interface {
++	Send(*EventBatch) error
++	grpc.ServerStream
++}
++
++type gameServiceSubscribeEventsServer struct {
++	grpc.ServerStream
++}
++
++func (x *gameServiceSubscribeEventsServer) Send(m *EventBatch) error {
++	return x.ServerStream.SendMsg(m)
++}
++
++// GameService_ServiceDesc is the grpc.ServiceDesc for GameService service.
++// It's only intended for direct use with grpc.RegisterService,
++// and not to be introspected or modified (even as a copy)
++var GameService_ServiceDesc = grpc.ServiceDesc{
++	ServiceName: "avitosha.v1.GameService",
++	HandlerType: (*GameServiceServer)(nil),
++	Methods: []grpc.MethodDesc{
++		{
++			MethodName: "EnsureProfile",
++			Handler:    _GameService_EnsureProfile_Handler,
++		},
++		{
++			MethodName: "RenamePet",
++			Handler:    _GameService_RenamePet_Handler,
++		},
++		{
++			MethodName: "ListTasks",
++			Handler:    _GameService_ListTasks_Handler,
++		},
++		{
++			MethodName: "GetTask",
++			Handler:    _GameService_GetTask_Handler,
++		},
++		{
++			MethodName: "GetTaskAdvice",
++			Handler:    _GameService_GetTaskAdvice_Handler,
++		},
++		{
++			MethodName: "GetRoom",
++			Handler:    _GameService_GetRoom_Handler,
++		},
++		{
++			MethodName: "GetStory",
++			Handler:    _GameService_GetStory_Handler,
++		},
++		{
++			MethodName: "GetDailySummary",
++			Handler:    _GameService_GetDailySummary_Handler,
++		},
++		{
++			MethodName: "GetLeaderboard",
++			Handler:    _GameService_GetLeaderboard_Handler,
++		},
++		{
++			MethodName: "GetAchievements",
++			Handler:    _GameService_GetAchievements_Handler,
++		},
++		{
++			MethodName: "GetRewardBalances",
++			Handler:    _GameService_GetRewardBalances_Handler,
++		},
++		{
++			MethodName: "GetRewardWallet",
++			Handler:    _GameService_GetRewardWallet_Handler,
++		},
++		{
++			MethodName: "ProcessAction",
++			Handler:    _GameService_ProcessAction_Handler,
++		},
++	},
++	Streams: []grpc.StreamDesc{
++		{
++			StreamName:    "SubscribeEvents",
++			Handler:       _GameService_SubscribeEvents_Handler,
++			ServerStreams: true,
++		},
++	},
++	Metadata: "avitosha/v1/services.proto",
++}
+diff --git a/app/backend/internal/handler/game_ws.go b/app/backend/internal/handler/game_ws.go
+index 3a3e91b..a4a994b 100644
+--- a/app/backend/internal/handler/game_ws.go
++++ b/app/backend/internal/handler/game_ws.go
+@@ -20,13 +20,13 @@ const (
+ 
+ type GameWebSocketHandler struct {
+ 	logger   *slog.Logger
+-	hub      *realtime.Hub
++	hub      realtime.EventSubscriber
+ 	upgrader websocket.Upgrader
+ }
+ 
+ func NewGameWebSocketHandler(
+ 	logger *slog.Logger,
+-	hub *realtime.Hub,
++	hub realtime.EventSubscriber,
+ 	frontendOrigin string,
+ ) GameWebSocketHandler {
+ 	if logger == nil {
+diff --git a/app/backend/internal/handler/router.go b/app/backend/internal/handler/router.go
+index e618676..c8fbadc 100644
+--- a/app/backend/internal/handler/router.go
++++ b/app/backend/internal/handler/router.go
+@@ -34,7 +34,7 @@ type RouterDependencies struct {
+ 	RefreshTokenTTL          time.Duration
+ 	SecureRefreshCookie      bool
+ 	GameService              GameUseCase
+-	EventHub                 *realtime.Hub
++	EventHub                 realtime.EventSubscriber
+ 	Now                      func() time.Time
+ }
+ 
+diff --git a/app/backend/internal/realtime/hub.go b/app/backend/internal/realtime/hub.go
+index d221928..2323aab 100644
+--- a/app/backend/internal/realtime/hub.go
++++ b/app/backend/internal/realtime/hub.go
+@@ -16,6 +16,15 @@ type Hub struct {
+ 	byUser     map[uuid.UUID]map[*Subscription]struct{}
+ }
+ 
++type EventSubscription interface {
++	Messages() <-chan []model.DomainEvent
++	Close()
++}
++
++type EventSubscriber interface {
++	Subscribe(uuid.UUID) EventSubscription
++}
++
+ type Subscription struct {
+ 	hub      *Hub
+ 	userID   uuid.UUID
+@@ -30,7 +39,7 @@ func NewHub(bufferSize int) *Hub {
+ 	return &Hub{bufferSize: bufferSize, byUser: make(map[uuid.UUID]map[*Subscription]struct{})}
+ }
+ 
+-func (hub *Hub) Subscribe(userID uuid.UUID) *Subscription {
++func (hub *Hub) Subscribe(userID uuid.UUID) EventSubscription {
+ 	hub.mu.Lock()
+ 	defer hub.mu.Unlock()
+ 
+diff --git a/app/backend/internal/rpc/errors.go b/app/backend/internal/rpc/errors.go
+new file mode 100644
+index 0000000..bda13d5
+--- /dev/null
++++ b/app/backend/internal/rpc/errors.go
+@@ -0,0 +1,95 @@
++package rpc
++
++import (
++	"errors"
++
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/usecase"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++const (
++	ReasonInvalidInput       = "INVALID_INPUT"
++	ReasonEmailAlreadyExists = "EMAIL_ALREADY_EXISTS"
++	ReasonInvalidCredentials = "INVALID_CREDENTIALS"
++	ReasonSessionExpired     = "SESSION_EXPIRED"
++	ReasonUnauthorized       = "UNAUTHORIZED"
++	ReasonInvalidPetName     = "INVALID_PET_NAME"
++	ReasonForbiddenPetName   = "FORBIDDEN_PET_NAME"
++	ReasonInvalidAction      = "INVALID_ACTION"
++	ReasonEventIDConflict    = "EVENT_ID_CONFLICT"
++	ReasonTaskNotFound       = "TASK_NOT_FOUND"
++	ReasonStoryNotFound      = "STORY_NOT_FOUND"
++)
++
++func AuthError(err error) error {
++	switch {
++	case errors.Is(err, usecase.ErrInvalidInput):
++		return status.Error(codes.InvalidArgument, ReasonInvalidInput)
++	case errors.Is(err, usecase.ErrEmailAlreadyExists):
++		return status.Error(codes.AlreadyExists, ReasonEmailAlreadyExists)
++	case errors.Is(err, usecase.ErrInvalidCredentials):
++		return status.Error(codes.Unauthenticated, ReasonInvalidCredentials)
++	case errors.Is(err, usecase.ErrSessionExpired):
++		return status.Error(codes.Unauthenticated, ReasonSessionExpired)
++	case errors.Is(err, usecase.ErrUnauthorized):
++		return status.Error(codes.Unauthenticated, ReasonUnauthorized)
++	default:
++		return status.Error(codes.Internal, "INTERNAL")
++	}
++}
++
++func DecodeAuthError(err error) error {
++	switch status.Convert(err).Message() {
++	case ReasonInvalidInput:
++		return usecase.ErrInvalidInput
++	case ReasonEmailAlreadyExists:
++		return usecase.ErrEmailAlreadyExists
++	case ReasonInvalidCredentials:
++		return usecase.ErrInvalidCredentials
++	case ReasonSessionExpired:
++		return usecase.ErrSessionExpired
++	case ReasonUnauthorized:
++		return usecase.ErrUnauthorized
++	default:
++		return usecase.ErrInternal
++	}
++}
++
++func GameError(err error) error {
++	switch {
++	case errors.Is(err, usecase.ErrInvalidPetName):
++		return status.Error(codes.InvalidArgument, ReasonInvalidPetName)
++	case errors.Is(err, usecase.ErrForbiddenPetName):
++		return status.Error(codes.InvalidArgument, ReasonForbiddenPetName)
++	case errors.Is(err, usecase.ErrInvalidAction):
++		return status.Error(codes.InvalidArgument, ReasonInvalidAction)
++	case errors.Is(err, usecase.ErrEventIDConflict):
++		return status.Error(codes.AlreadyExists, ReasonEventIDConflict)
++	case errors.Is(err, usecase.ErrTaskNotFound):
++		return status.Error(codes.NotFound, ReasonTaskNotFound)
++	case errors.Is(err, usecase.ErrStoryNotFound):
++		return status.Error(codes.NotFound, ReasonStoryNotFound)
++	default:
++		return status.Error(codes.Internal, "INTERNAL")
++	}
++}
++
++func DecodeGameError(err error) error {
++	switch status.Convert(err).Message() {
++	case ReasonInvalidPetName:
++		return usecase.ErrInvalidPetName
++	case ReasonForbiddenPetName:
++		return usecase.ErrForbiddenPetName
++	case ReasonInvalidAction:
++		return usecase.ErrInvalidAction
++	case ReasonEventIDConflict:
++		return usecase.ErrEventIDConflict
++	case ReasonTaskNotFound:
++		return usecase.ErrTaskNotFound
++	case ReasonStoryNotFound:
++		return usecase.ErrStoryNotFound
++	default:
++		return usecase.ErrUnexpectedStorage
++	}
++}
+diff --git a/app/backend/internal/transport/grpc/authserver/server.go b/app/backend/internal/transport/grpc/authserver/server.go
+new file mode 100644
+index 0000000..301cb27
+--- /dev/null
++++ b/app/backend/internal/transport/grpc/authserver/server.go
+@@ -0,0 +1,127 @@
++package authserver
++
++import (
++	"context"
++	"strings"
++	"time"
++
++	"github.com/google/uuid"
++	avitoshav1 "github.com/guitaramust-sudo/Avitosha/app/backend/internal/gen/avitosha/v1"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/model"
++	internalrpc "github.com/guitaramust-sudo/Avitosha/app/backend/internal/rpc"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/usecase"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++type AuthUseCase interface {
++	Register(context.Context, usecase.RegisterParams) (usecase.AuthenticationResult, error)
++	Login(context.Context, usecase.LoginParams) (usecase.AuthenticationResult, error)
++	Refresh(context.Context, usecase.RefreshParams) (usecase.RefreshResult, error)
++	Logout(context.Context, usecase.LogoutParams) error
++	GetCurrentUser(context.Context, usecase.GetCurrentUserParams) (model.User, error)
++}
++
++type TokenAuthenticator interface {
++	AuthenticateAccessToken(context.Context, string) (model.AuthenticatedUser, error)
++}
++
++type Server struct {
++	avitoshav1.UnimplementedAuthServiceServer
++	auth          AuthUseCase
++	authenticator TokenAuthenticator
++}
++
++func New(auth AuthUseCase, authenticator TokenAuthenticator) *Server {
++	return &Server{auth: auth, authenticator: authenticator}
++}
++
++func (s *Server) Register(ctx context.Context, request *avitoshav1.RegisterRequest) (*avitoshav1.AuthenticationResponse, error) {
++	result, err := s.auth.Register(ctx, usecase.RegisterParams{
++		Email: request.GetEmail(), Password: request.GetPassword(), UserAgent: optionalString(request.GetUserAgent()),
++	})
++	if err != nil {
++		return nil, internalrpc.AuthError(err)
++	}
++	return authenticationResponse(result), nil
++}
++
++func (s *Server) Login(ctx context.Context, request *avitoshav1.LoginRequest) (*avitoshav1.AuthenticationResponse, error) {
++	result, err := s.auth.Login(ctx, usecase.LoginParams{
++		Email: request.GetEmail(), Password: request.GetPassword(), UserAgent: optionalString(request.GetUserAgent()),
++	})
++	if err != nil {
++		return nil, internalrpc.AuthError(err)
++	}
++	return authenticationResponse(result), nil
++}
++
++func (s *Server) Refresh(ctx context.Context, request *avitoshav1.RefreshRequest) (*avitoshav1.RefreshResponse, error) {
++	result, err := s.auth.Refresh(ctx, usecase.RefreshParams{RefreshToken: request.GetRefreshToken()})
++	if err != nil {
++		return nil, internalrpc.AuthError(err)
++	}
++	return &avitoshav1.RefreshResponse{AccessToken: result.AccessToken, RefreshToken: result.RefreshToken}, nil
++}
++
++func (s *Server) Logout(ctx context.Context, request *avitoshav1.LogoutRequest) (*avitoshav1.Empty, error) {
++	if err := s.auth.Logout(ctx, usecase.LogoutParams{RefreshToken: request.GetRefreshToken()}); err != nil {
++		return nil, internalrpc.AuthError(err)
++	}
++	return &avitoshav1.Empty{}, nil
++}
++
++func (s *Server) GetCurrentUser(ctx context.Context, request *avitoshav1.GetCurrentUserRequest) (*avitoshav1.UserResponse, error) {
++	identity, err := parseIdentity(request.GetUserId(), request.GetSessionId())
++	if err != nil {
++		return nil, err
++	}
++	user, err := s.auth.GetCurrentUser(ctx, usecase.GetCurrentUserParams{AuthenticatedUser: identity})
++	if err != nil {
++		return nil, internalrpc.AuthError(err)
++	}
++	return &avitoshav1.UserResponse{User: userMessage(user)}, nil
++}
++
++func (s *Server) AuthenticateAccessToken(ctx context.Context, request *avitoshav1.AuthenticateAccessTokenRequest) (*avitoshav1.AuthenticatedUserResponse, error) {
++	identity, err := s.authenticator.AuthenticateAccessToken(ctx, request.GetAccessToken())
++	if err != nil {
++		return nil, internalrpc.AuthError(err)
++	}
++	return &avitoshav1.AuthenticatedUserResponse{
++		UserId: identity.UserID.String(), SessionId: identity.SessionID.String(),
++	}, nil
++}
++
++func authenticationResponse(result usecase.AuthenticationResult) *avitoshav1.AuthenticationResponse {
++	return &avitoshav1.AuthenticationResponse{
++		User: userMessage(result.User), AccessToken: result.AccessToken, RefreshToken: result.RefreshToken,
++	}
++}
++
++func userMessage(user model.User) *avitoshav1.User {
++	return &avitoshav1.User{
++		Id: user.ID.String(), Email: user.Email,
++		CreatedAt: user.CreatedAt.UTC().Format(time.RFC3339Nano), UpdatedAt: user.UpdatedAt.UTC().Format(time.RFC3339Nano),
++	}
++}
++
++func optionalString(value string) *string {
++	value = strings.TrimSpace(value)
++	if value == "" {
++		return nil
++	}
++	return &value
++}
++
++func parseIdentity(userIDValue, sessionIDValue string) (model.AuthenticatedUser, error) {
++	userID, err := uuid.Parse(userIDValue)
++	if err != nil {
++		return model.AuthenticatedUser{}, status.Error(codes.InvalidArgument, "user_id must be a UUID")
++	}
++	sessionID, err := uuid.Parse(sessionIDValue)
++	if err != nil {
++		return model.AuthenticatedUser{}, status.Error(codes.InvalidArgument, "session_id must be a UUID")
++	}
++	return model.AuthenticatedUser{UserID: userID, SessionID: sessionID}, nil
++}
+diff --git a/app/backend/internal/transport/grpc/gameserver/server.go b/app/backend/internal/transport/grpc/gameserver/server.go
+new file mode 100644
+index 0000000..ed6fddb
+--- /dev/null
++++ b/app/backend/internal/transport/grpc/gameserver/server.go
+@@ -0,0 +1,232 @@
++package gameserver
++
++import (
++	"context"
++	"encoding/json"
++	"time"
++
++	"github.com/google/uuid"
++	avitoshav1 "github.com/guitaramust-sudo/Avitosha/app/backend/internal/gen/avitosha/v1"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/model"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/realtime"
++	internalrpc "github.com/guitaramust-sudo/Avitosha/app/backend/internal/rpc"
++	"github.com/guitaramust-sudo/Avitosha/app/backend/internal/usecase"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
++)
++
++type GameUseCase interface {
++	EnsureProfile(context.Context, uuid.UUID, time.Time) (usecase.GameProfile, error)
++	RenamePet(context.Context, uuid.UUID, string, time.Time) (usecase.GameProfile, error)
++	ListTasks(context.Context, uuid.UUID, time.Time) ([]model.TaskProgress, error)
++	GetTask(context.Context, uuid.UUID, uuid.UUID, time.Time) (model.TaskProgress, error)
++	GetTaskAdvice(context.Context, uuid.UUID, uuid.UUID, time.Time) (usecase.TaskAdvice, error)
++	GetRoom(context.Context, uuid.UUID, time.Time) ([]model.RoomItemProgress, error)
++	GetStory(context.Context, uuid.UUID, time.Time) (model.StorySnapshot, error)
++	GetDailySummary(context.Context, uuid.UUID, time.Time) (usecase.DailySummary, error)
++	GetLeaderboard(context.Context, uuid.UUID, int, time.Time) (usecase.Leaderboard, error)
++	GetAchievements(context.Context, uuid.UUID, time.Time) ([]model.AchievementProgress, error)
++	GetRewardBalances(context.Context, uuid.UUID, time.Time) ([]model.RewardBalance, error)
++	GetRewardWallet(context.Context, uuid.UUID, time.Time) (usecase.RewardWallet, error)
++	ProcessAction(context.Context, usecase.ProcessActionCommand) (usecase.ProcessActionResult, error)
++}
++
++type Server struct {
++	avitoshav1.UnimplementedGameServiceServer
++	game GameUseCase
++	hub  *realtime.Hub
++}
++
++func New(game GameUseCase, hub *realtime.Hub) *Server { return &Server{game: game, hub: hub} }
++
++func (s *Server) EnsureProfile(ctx context.Context, request *avitoshav1.UserAtRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.EnsureProfile(ctx, userID, at))
++}
++
++func (s *Server) RenamePet(ctx context.Context, request *avitoshav1.RenamePetRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.RenamePet(ctx, userID, request.GetName(), at))
++}
++
++func (s *Server) ListTasks(ctx context.Context, request *avitoshav1.UserAtRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.ListTasks(ctx, userID, at))
++}
++
++func (s *Server) GetTask(ctx context.Context, request *avitoshav1.TaskRequest) (*avitoshav1.JsonResponse, error) {
++	userID, taskID, at, err := parseTaskRequest(request)
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetTask(ctx, userID, taskID, at))
++}
++
++func (s *Server) GetTaskAdvice(ctx context.Context, request *avitoshav1.TaskRequest) (*avitoshav1.JsonResponse, error) {
++	userID, taskID, at, err := parseTaskRequest(request)
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetTaskAdvice(ctx, userID, taskID, at))
++}
++
++func (s *Server) GetRoom(ctx context.Context, request *avitoshav1.UserAtRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetRoom(ctx, userID, at))
++}
++
++func (s *Server) GetStory(ctx context.Context, request *avitoshav1.UserAtRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetStory(ctx, userID, at))
++}
++
++func (s *Server) GetDailySummary(ctx context.Context, request *avitoshav1.UserAtRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetDailySummary(ctx, userID, at))
++}
++
++func (s *Server) GetLeaderboard(ctx context.Context, request *avitoshav1.LeaderboardRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetLeaderboard(ctx, userID, int(request.GetLimit()), at))
++}
++
++func (s *Server) GetAchievements(ctx context.Context, request *avitoshav1.UserAtRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetAchievements(ctx, userID, at))
++}
++
++func (s *Server) GetRewardBalances(ctx context.Context, request *avitoshav1.UserAtRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetRewardBalances(ctx, userID, at))
++}
++
++func (s *Server) GetRewardWallet(ctx context.Context, request *avitoshav1.UserAtRequest) (*avitoshav1.JsonResponse, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return nil, err
++	}
++	return encode(s.game.GetRewardWallet(ctx, userID, at))
++}
++
++func (s *Server) ProcessAction(ctx context.Context, request *avitoshav1.ProcessActionRequest) (*avitoshav1.JsonResponse, error) {
++	userID, err := parseUUID("user_id", request.GetUserId())
++	if err != nil {
++		return nil, err
++	}
++	eventID, err := parseUUID("event_id", request.GetEventId())
++	if err != nil {
++		return nil, err
++	}
++	occurredAt, err := parseTime("occurred_at", request.GetOccurredAt())
++	if err != nil {
++		return nil, err
++	}
++	now, err := parseTime("now", request.GetNow())
++	if err != nil {
++		return nil, err
++	}
++	command := usecase.ProcessActionCommand{
++		UserID: userID, EventID: eventID, ActionType: model.ActionType(request.GetActionType()),
++		EntityID: request.EntityId, Category: request.Category, Metadata: json.RawMessage(request.GetMetadataJson()),
++		OccurredAt: occurredAt, Now: now,
++	}
++	return encode(s.game.ProcessAction(ctx, command))
++}
++
++func (s *Server) SubscribeEvents(request *avitoshav1.SubscribeEventsRequest, stream avitoshav1.GameService_SubscribeEventsServer) error {
++	userID, err := parseUUID("user_id", request.GetUserId())
++	if err != nil {
++		return err
++	}
++	subscription := s.hub.Subscribe(userID)
++	defer subscription.Close()
++	for {
++		select {
++		case <-stream.Context().Done():
++			return nil
++		case events, ok := <-subscription.Messages():
++			if !ok {
++				return nil
++			}
++			payload, marshalErr := json.Marshal(events)
++			if marshalErr != nil {
++				return status.Error(codes.Internal, "encode event batch")
++			}
++			if sendErr := stream.Send(&avitoshav1.EventBatch{PayloadJson: payload}); sendErr != nil {
++				return sendErr
++			}
++		}
++	}
++}
++
++func encode[T any](value T, err error) (*avitoshav1.JsonResponse, error) {
++	if err != nil {
++		return nil, internalrpc.GameError(err)
++	}
++	payload, err := json.Marshal(value)
++	if err != nil {
++		return nil, status.Error(codes.Internal, "encode response")
++	}
++	return &avitoshav1.JsonResponse{PayloadJson: payload}, nil
++}
++
++func parseUserAt(userIDValue, atValue string) (uuid.UUID, time.Time, error) {
++	userID, err := parseUUID("user_id", userIDValue)
++	if err != nil {
++		return uuid.Nil, time.Time{}, err
++	}
++	at, err := parseTime("at", atValue)
++	return userID, at, err
++}
++
++func parseTaskRequest(request *avitoshav1.TaskRequest) (uuid.UUID, uuid.UUID, time.Time, error) {
++	userID, at, err := parseUserAt(request.GetUserId(), request.GetAt())
++	if err != nil {
++		return uuid.Nil, uuid.Nil, time.Time{}, err
++	}
++	taskID, err := parseUUID("task_id", request.GetTaskId())
++	return userID, taskID, at, err
++}
++
++func parseUUID(field, value string) (uuid.UUID, error) {
++	parsed, err := uuid.Parse(value)
++	if err != nil {
++		return uuid.Nil, status.Errorf(codes.InvalidArgument, "%s must be a UUID", field)
++	}
++	return parsed, nil
++}
++
++func parseTime(field, value string) (time.Time, error) {
++	parsed, err := time.Parse(time.RFC3339Nano, value)
++	if err != nil {
++		return time.Time{}, status.Errorf(codes.InvalidArgument, "%s must be RFC3339", field)
++	}
++	return parsed, nil
++}
+diff --git a/app/backend/scripts/smoke-game.sh b/app/backend/scripts/smoke-game.sh
+index e322825..ec71d7e 100755
+--- a/app/backend/scripts/smoke-game.sh
++++ b/app/backend/scripts/smoke-game.sh
+@@ -43,6 +43,6 @@ curl --fail --silent --show-error -H "$auth_header" "$api_url/api/v1/room" | jq
+ curl --fail --silent --show-error -H "$auth_header" "$api_url/api/v1/story" | jq -e '.currentStage == 1' >/dev/null
+ curl --fail --silent --show-error -H "$auth_header" "$api_url/api/v1/daily-summary" | jq -e '.actionsCount == 5 and .earnedXp == 30' >/dev/null
+ curl --fail --silent --show-error -H "$auth_header" "$api_url/api/v1/leaderboard?period=weekly&limit=10" | jq -e '.currentUser.score == 100' >/dev/null
+-curl --fail --silent --show-error -H "$auth_header" "$api_url/api/v1/rewards/balance" | jq -e '.balances[] | select(.type == "AVITO_BONUS" and .balance == 10 and .earnedTotal == 10)' >/dev/null
++curl --fail --silent --show-error -H "$auth_header" "$api_url/api/v1/rewards/balance" | jq -e '.balances[] | select(.type == "AVITO_BONUS" and .balance == 12 and .earnedTotal == 12)' >/dev/null
+ 
+ echo "Avitosha smoke scenario passed for $email"
+-- 
+2.50.1 (Apple Git-155)
+
